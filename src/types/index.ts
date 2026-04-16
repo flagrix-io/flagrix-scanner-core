@@ -1,0 +1,227 @@
+/**
+ * Core type definitions for @flagrix/scanner-core
+ * Shared across GitHub, LinkedIn, and PDF scanners.
+ */
+
+// ─── Risk primitives ────────────────────────────────────────────────────────
+
+export type RiskLevel = "low" | "medium" | "high"
+
+export interface RiskFactor {
+  factor: string
+  weight: number
+  description: string
+}
+
+export interface RiskAssessment {
+  riskScore: number // 0–1 scale
+  riskLevel: RiskLevel
+  factors: RiskFactor[]
+  disclaimer: string
+}
+
+// ─── LinkedIn ────────────────────────────────────────────────────────────────
+
+export interface LinkedInProfileFeatures {
+  profileUrl: string
+  accountAgeDays: number | null
+  connectionCount: number | null
+  followerCount: number | null
+  hasProfilePhoto: boolean
+  workHistoryCount: number
+  educationCount: number
+  endorsementCount: number
+  postCount: number
+  mutualConnections: number
+  profileCompleteness: number // 0–1 scale
+  name: string | null
+  headline: string | null
+  location: string | null
+  isVerified: boolean
+  isTopVoice: boolean
+  hasJobPostings: boolean
+  hasOpenToWork: boolean
+}
+
+export interface LinkedInScanResult extends RiskAssessment {
+  profile: LinkedInProfileFeatures
+  scannedAt: Date
+}
+
+// ─── GitHub repo ─────────────────────────────────────────────────────────────
+
+export type ScanDepth = "quick" | "standard" | "deep"
+
+export interface GitHubRepoInfo {
+  owner: string
+  repo: string
+  branch: string
+  url: string
+}
+
+export interface GitHubFinding {
+  severity: "critical" | "high" | "medium" | "low" | "info"
+  type:
+    | "MALWARE_SIGNATURE"
+    | "OBFUSCATED_CODE"
+    | "SUSPICIOUS_DEPENDENCY"
+    | "POSTINSTALL_SCRIPT"
+    | "TYPOSQUAT_PACKAGE"
+    | "HIDDEN_FILE"
+    | "SUSPICIOUS_URL"
+    | "NON_ENGLISH_COMMENTS"
+    | "SUSPICIOUS_PACKAGE_NAME"
+    | "HARDCODED_SECRETS"
+    | "NETWORK_COMMUNICATION"
+    | "CRYPTO_MINER"
+    | "DATA_EXFILTRATION"
+    | "BACKDOOR"
+    | "SUPPLY_CHAIN_RISK"
+    | "SUSPICIOUS_FILE_ACCESS"
+    | "CODE_INTEGRITY_ISSUE"
+    | "SOCIAL_ENGINEERING"
+  file?: string
+  line?: number
+  pattern?: string
+  package?: string
+  description: string
+  files?: string[]
+  codeSnippet?: string
+  codeExplanation?: string
+}
+
+export interface GitHubScanResult extends RiskAssessment {
+  repo: GitHubRepoInfo
+  scanSummary: {
+    filesScanned: number
+    patternsMatched: number
+    dependenciesChecked: number
+  }
+  findings: GitHubFinding[]
+  safeToClone: boolean
+  scannedAt: Date
+}
+
+// ─── GitHub user ─────────────────────────────────────────────────────────────
+
+export interface GitHubUserFeatures {
+  username: string
+  accountAgeDays: number
+  followers: number
+  following: number
+  followerFollowingRatio: number
+  publicRepos: number
+  ownedReposCount: number
+  totalStars: number
+  repoStarRatio: number
+  hasProfilePhoto: boolean
+  isProfileComplete: boolean
+  hasCompany: boolean
+  hasBio: boolean
+  recentEventCount: number
+  veryRecentEventCount: number
+  profileUrl: string
+  scannedAt: string
+}
+
+export interface GitHubUserScanResult {
+  username: string
+  riskLevel: RiskLevel
+  riskScore: number
+  riskFactors: RiskFactor[]
+  trustSignals: RiskFactor[]
+  recommendation: string
+  profileUrl: string
+  accountAgeDays: number
+  followers: number
+  publicRepos: number
+  scannedAt: string
+}
+
+// ─── PDF / Document ──────────────────────────────────────────────────────────
+
+export interface DocumentMetadata {
+  type: string
+  sizeBytes: number
+  pages?: number
+  hash: string
+}
+
+export interface StaticAnalysisResult {
+  hasJavaScript: boolean
+  hasEmbeddedFiles: boolean
+  hasLaunchAction: boolean
+  hasSuspiciousUrls: boolean
+  suspiciousUrls?: string[]
+}
+
+export interface VirusTotalResult {
+  detected: boolean
+  enginesChecked: number
+  detections: number
+  scanId?: string
+}
+
+export interface DocumentScanResult extends RiskAssessment {
+  metadata: DocumentMetadata
+  staticAnalysis: StaticAnalysisResult
+  virusTotal?: VirusTotalResult
+  safeToOpen: boolean
+  scannedAt: Date
+}
+
+// ─── Signature database ──────────────────────────────────────────────────────
+
+export interface MaliciousPackage {
+  name: string
+  version?: string
+  severity: "critical" | "high" | "medium"
+  source: string
+  description?: string
+}
+
+export interface YaraRule {
+  id: string
+  name: string
+  pattern: string
+  description: string
+  tags: string[]
+  severity: "critical" | "high" | "medium" | "low"
+}
+
+export interface KnownBadHash {
+  sha256: string
+  type: "pdf" | "js" | "binary"
+  malwareFamily?: string
+  source: string
+}
+
+export interface SignatureDatabase {
+  version: string
+  lastUpdated: Date
+  maliciousPackages: MaliciousPackage[]
+  yaraRules: YaraRule[]
+  knownBadHashes: KnownBadHash[]
+}
+
+// ─── Scanner options ─────────────────────────────────────────────────────────
+
+export interface RepoScanOptions {
+  githubToken?: string
+  signatures: SignatureDatabase
+}
+
+export interface UserScanOptions {
+  githubToken?: string
+}
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+export const RISK_THRESHOLDS = {
+  low: 0.3,
+  medium: 0.6,
+  high: 0.6,
+} as const
+
+export const DEFAULT_DISCLAIMER =
+  "Risk assessment only. Not a definitive fraud determination. Always verify through official channels."

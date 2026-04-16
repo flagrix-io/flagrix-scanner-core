@@ -1,0 +1,32 @@
+{
+  "name": "@flagrix/scanner-core",
+  "version": "0.1.0",
+  "description": "Core security scanning logic for Flagrix — GitHub repo scanner, user profile scorer, LinkedIn scorer, PDF analyzer",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/flagrix/flagrix-scanner-core"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "franc-min": "^6.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^1.6.0"
+  }
+}
