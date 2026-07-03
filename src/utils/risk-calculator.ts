@@ -1,4 +1,5 @@
 import type { GitHubFinding, RiskLevel } from "../types/index"
+import { RISK_THRESHOLDS } from "../types/index"
 
 export function getSeverityWeight(severity: GitHubFinding["severity"]): number {
   const weights: Record<GitHubFinding["severity"], number> = {
@@ -20,7 +21,7 @@ export function calculateRiskScore(findings: GitHubFinding[]): number {
 }
 
 export function getRiskLevel(score: number): RiskLevel {
-  if (score < 0.3) return "low"
-  if (score < 0.6) return "medium"
+  if (score < RISK_THRESHOLDS.low) return "low"
+  if (score < RISK_THRESHOLDS.high) return "medium"
   return "high"
 }

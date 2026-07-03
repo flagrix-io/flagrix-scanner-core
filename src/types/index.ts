@@ -217,9 +217,14 @@ export interface UserScanOptions {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
+/**
+ * Score boundaries used by `getRiskLevel` (repo scans) and the LinkedIn profile
+ * scorer: a score below `low` is low risk, below `high` is medium risk, and at
+ * or above `high` is high risk. The GitHub user scanner applies its own tuned
+ * thresholds because profile signals distribute differently from code findings.
+ */
 export const RISK_THRESHOLDS = {
   low: 0.3,
-  medium: 0.6,
   high: 0.6,
 } as const
 

@@ -563,8 +563,15 @@ function extractCodeSnippet(line: string, maxLength = 500): string {
 
 const ENGLISH_CODES = ["eng", "sco"]
 const MIN_WORD_LENGTH = 5
-const MIN_WORDS_TO_ANALYZE = 10
-const NON_ENGLISH_THRESHOLD = 0.05
+// Thresholds are intentionally conservative: language detection on short code
+// comments is noisy, so we only flag repos with a substantial volume of comments
+// that are clearly (not marginally) non-English, to avoid false-flagging
+// legitimate English or internationally-commented projects.
+const MIN_WORDS_TO_ANALYZE = 30
+const NON_ENGLISH_THRESHOLD = 0.25
+const MIN_NON_ENGLISH_WORDS = 8
+// Only run language detection on comments long enough for franc to be reliable.
+const MIN_COMMENT_LEN_FOR_DETECTION = 40
 
 const COMMENT_PATTERNS: Record<string, RegExp[]> = {
   javascript: [/\/\/(.*)$/gm, /\/\*[\s\S]*?\*\//g],
@@ -631,7 +638,7 @@ function analyzeCommentLanguages(
     fileAnalysis.totalWords += words.length
     fileAnalysis.totalComments += 1
 
-    if (comment.length >= 20) {
+    if (comment.length >= MIN_COMMENT_LEN_FOR_DETECTION) {
       const detectedLang = franc(comment)
 
       if (detectedLang && detectedLang !== "und") {
@@ -683,7 +690,10 @@ async function detectNonEnglishComments(
   if (analysis.totalWords >= MIN_WORDS_TO_ANALYZE) {
     analysis.nonEnglishPercentage = analysis.nonEnglishWords / analysis.totalWords
 
-    if (analysis.nonEnglishPercentage >= NON_ENGLISH_THRESHOLD) {
+    if (
+      analysis.nonEnglishPercentage >= NON_ENGLISH_THRESHOLD &&
+      analysis.nonEnglishWords >= MIN_NON_ENGLISH_WORDS
+    ) {
       const topFiles = Array.from(analysis.filesWithNonEnglish.entries())
         .sort((a, b) => b[1] - a[1])
         .slice(0, 3)
@@ -819,7 +829,10 @@ function detectNetworkPatterns(content: string, filePath: string): GitHubFinding
   if (isTestFile(filePath)) return findings
 
   const suspiciousPatterns = [
-    { pattern: /(?:https?:\/\/)?(?<!\d)(?!(?:127\.|192\.168\.|10\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|localhost))\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?/g, type: "Hardcoded IP Address", severity: "high" as const },
+    // Valid public IPv4 only: each octet bounded 0–255, not embedded in a longer
+    // dotted/number sequence (avoids flagging version strings like "1.2.3.4.5" or
+    // impossible IPs like "999.999.999.999"), and excluding private/link-local ranges.
+    { pattern: /(?:https?:\/\/)?(?<![\d.])(?!(?:127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.))(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?![\d.])(?::\d{1,5})?/g, type: "Hardcoded IP Address", severity: "high" as const },
     { pattern: /https?:\/\/discord(?:app)?\.com\/api\/webhooks\/\d+\/[a-zA-Z0-9_-]+/gi, type: "Discord Webhook", severity: "critical" as const },
     { pattern: /\d{8,10}:[a-zA-Z0-9_-]{35}/g, type: "Telegram Bot Token", severity: "high" as const },
     { pattern: /(?:pastebin\.com|hastebin\.com|paste\.ee)\/[a-zA-Z0-9]+/gi, type: "Pastebin URL", severity: "medium" as const },

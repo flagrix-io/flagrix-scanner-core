@@ -137,6 +137,6 @@ export function scoreLinkedInProfile(
 
 function getRiskLevel(score: number): RiskLevel {
   if (score < RISK_THRESHOLDS.low) return "low"
-  if (score < RISK_THRESHOLDS.medium) return "medium"
+  if (score < RISK_THRESHOLDS.high) return "medium"
   return "high"
 }
