@@ -1,0 +1,60 @@
+# @flagrix/scanner-core
+
+Open-source scanning engine behind [Flagrix](https://flagrix.io) — detects malware, backdoors, and supply-chain attacks in GitHub repositories, GitHub profiles, and PDF documents.
+
+Built after real-world fake-recruiter campaigns ("coding assignment" repos that steal wallets, SSH keys, and browser sessions) started targeting developers. Flagrix scans before you clone.
+
+## What it detects
+
+- Known malicious npm packages (active campaign IOCs, typosquats)
+- Obfuscated JavaScript (hex arrays, eval chains, base64 droppers)
+- Supply-chain attacks (dependency confusion, install-time scripts)
+- Backdoors, reverse shells, and data-exfiltration patterns
+- Crypto miners and credential/wallet stealers
+- Suspicious install hooks (postinstall, curl-pipe-bash)
+- Social-engineering markers and repository anomalies
+- Malicious PDFs (embedded JavaScript, auto-open actions, executable links)
+
+Signature data lives in the sibling repo [flagrix-detection-rules](https://github.com/flagrix-io/flagrix-detection-rules).
+
+## Usage
+
+```ts
+import { scanGitHubRepo, type SignatureDatabase } from "@flagrix/scanner-core"
+
+const result = await scanGitHubRepo(
+  { owner: "some-org", repo: "some-repo", branch: "main", url: "https://github.com/some-org/some-repo" },
+  { signatures, githubToken } // token optional — raises rate limits, enables private repos
+)
+
+console.log(result.riskLevel) // "low" | "medium" | "high"
+console.log(result.findings)  // detailed findings with severity + evidence
+```
+
+Also exported: `scanGitHubUser` (profile authenticity scoring), `scoreLinkedInProfile`, `scanPdfBytes` / `scanPdfFromUrl`, and the shared risk-calculation utilities. See [src/index.ts](src/index.ts) for the full API.
+
+## Development
+
+```bash
+npm install
+npm run build   # tsc → dist/
+npm test        # vitest
+```
+
+Pure TypeScript with a single runtime dependency (`franc-min` for language detection). Callers inject network and storage — the primary consumer is the Flagrix Chrome extension, which supplies `fetch` results and signature data.
+
+## Disclaimer
+
+Risk assessments are informational, not definitive malware or fraud determinations. Always verify through official channels.
+
+## AI Disclosure
+
+This project leverages Claude AI for boilerplate generation, test-suite expansion, and optimization. All AI-generated code is strictly reviewed, refactored, and verified by human maintainers before merging.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+*Part of the [Flagrix](https://flagrix.io) open-core security platform.*
