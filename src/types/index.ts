@@ -202,6 +202,64 @@ export interface SignatureDatabase {
   maliciousPackages: MaliciousPackage[]
   yaraRules: YaraRule[]
   knownBadHashes: KnownBadHash[]
+  /** GitHub user-profile scoring ruleset. Optional — falls back to the
+   *  scanner's built-in DEFAULT_USER_PROFILE_RULES when absent. */
+  userProfileRules?: UserProfileRuleset
+}
+
+// ─── GitHub user-profile scoring ruleset ─────────────────────────────────────
+
+/** Feature fields on GitHubUserFeatures that a profile condition may test. */
+export type ProfileFeatureField =
+  | "accountAgeDays"
+  | "followers"
+  | "following"
+  | "followerFollowingRatio"
+  | "ownedReposCount"
+  | "totalStars"
+  | "recentEventCount"
+  | "veryRecentEventCount"
+  | "hasProfilePhoto"
+  | "isProfileComplete"
+
+export type ProfileOperator = "lt" | "lte" | "gt" | "gte" | "eq"
+
+export interface ProfileSimpleCondition {
+  field: ProfileFeatureField
+  operator: ProfileOperator
+  value: number | boolean
+}
+
+/** Compound condition — matches only when every sub-condition matches. */
+export interface ProfileCompoundCondition {
+  all: ProfileSimpleCondition[]
+}
+
+export type ProfileCondition = ProfileSimpleCondition | ProfileCompoundCondition
+
+export interface ProfileRiskRule {
+  id: string
+  name: string
+  /** Supports `{fieldName}` tokens, interpolated from the scanned features. */
+  description: string
+  weight: number
+  condition: ProfileCondition
+  /** If the referenced rule id already matched, this rule is skipped. */
+  exclusiveWith?: string
+}
+
+export interface ProfileRiskLevels {
+  /** score ≥ this ⇒ at least medium risk */
+  mediumMinScore: number
+  /** score ≥ this ⇒ high risk */
+  highMinScore: number
+  recommendations: { low: string; medium: string; high: string }
+}
+
+export interface UserProfileRuleset {
+  riskFactors: ProfileRiskRule[]
+  trustSignals: ProfileRiskRule[]
+  riskLevels: ProfileRiskLevels
 }
 
 // ─── Scanner options ─────────────────────────────────────────────────────────
@@ -213,6 +271,9 @@ export interface RepoScanOptions {
 
 export interface UserScanOptions {
   githubToken?: string
+  /** Profile-scoring ruleset (typically from the fetched SignatureDatabase).
+   *  Falls back to DEFAULT_USER_PROFILE_RULES when omitted. */
+  userProfileRules?: UserProfileRuleset
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────

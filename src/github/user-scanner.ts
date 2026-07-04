@@ -5,28 +5,16 @@
  * No chrome.storage dependency — token is passed as an option.
  */
 
-import type { GitHubUserFeatures, GitHubUserScanResult, RiskFactor, UserScanOptions } from "../types/index"
-
-const WEIGHTS = {
-  VERY_NEW_ACCOUNT: 0.3,
-  NEW_ACCOUNT: 0.2,
-  NO_REPOS: 0.25,
-  NO_FOLLOWERS: 0.2,
-  HIGH_FOLLOWING_RATIO: 0.2,
-  NO_PROFILE_PHOTO: 0.15,
-  INCOMPLETE_PROFILE: 0.1,
-  NO_RECENT_ACTIVITY: 0.15,
-  SINGLE_REPO_CONTRIBUTOR: 0.15,
-
-  ESTABLISHED_ACCOUNT: -0.15,
-  VERY_ESTABLISHED: -0.25,
-  STRONG_FOLLOWER_BASE: -0.15,
-  POPULAR_DEVELOPER: -0.25,
-  ACTIVE_CONTRIBUTOR: -0.2,
-  PROLIFIC_DEVELOPER: -0.3,
-  HAS_POPULAR_REPOS: -0.2,
-  CONSISTENT_ACTIVITY: -0.15,
-}
+import type {
+  GitHubUserFeatures,
+  GitHubUserScanResult,
+  ProfileCondition,
+  ProfileRiskRule,
+  RiskFactor,
+  UserProfileRuleset,
+  UserScanOptions
+} from "../types/index"
+import { DEFAULT_USER_PROFILE_RULES } from "./user-profile-ruleset"
 
 interface GitHubAPIUser {
   login: string
@@ -55,7 +43,7 @@ export async function scanGitHubUser(
   options: UserScanOptions = {}
 ): Promise<GitHubUserScanResult> {
   const features = await fetchUserFeatures(username, options.githubToken)
-  return scoreUserProfile(features)
+  return scoreUserProfile(features, options.userProfileRules)
 }
 
 async function fetchUserFeatures(
@@ -130,97 +118,79 @@ async function fetchUserFeatures(
   }
 }
 
-function scoreUserProfile(features: GitHubUserFeatures): GitHubUserScanResult {
+// ─── Data-driven profile scoring ─────────────────────────────────────────────
+
+/** Fill `{fieldName}` tokens in a rule description from the scanned features. */
+function interpolate(description: string, features: GitHubUserFeatures): string {
+  return description.replace(/\{(\w+)\}/g, (_, key: string) => {
+    const value = (features as unknown as Record<string, unknown>)[key]
+    return value === undefined ? `{${key}}` : String(value)
+  })
+}
+
+function compare(
+  a: number | boolean,
+  operator: string,
+  b: number | boolean
+): boolean {
+  if (operator === "eq") return a === b
+  const x = Number(a)
+  const y = Number(b)
+  switch (operator) {
+    case "lt":
+      return x < y
+    case "lte":
+      return x <= y
+    case "gt":
+      return x > y
+    case "gte":
+      return x >= y
+    default:
+      return false // unknown operator → never match (fail safe)
+  }
+}
+
+function matches(features: GitHubUserFeatures, condition: ProfileCondition): boolean {
+  if ("all" in condition) {
+    return condition.all.every((c) => matches(features, c))
+  }
+  const actual = (features as unknown as Record<string, unknown>)[condition.field]
+  if (typeof actual !== "number" && typeof actual !== "boolean") return false
+  return compare(actual, condition.operator, condition.value)
+}
+
+function scoreUserProfile(
+  features: GitHubUserFeatures,
+  ruleset: UserProfileRuleset = DEFAULT_USER_PROFILE_RULES
+): GitHubUserScanResult {
   const riskFactors: RiskFactor[] = []
   const trustSignals: RiskFactor[] = []
-  let riskScore = 0.0
+  const matched = new Set<string>()
+  let riskScore = 0
 
-  if (features.accountAgeDays < 30) {
-    riskFactors.push({ factor: "VERY_NEW_ACCOUNT", weight: WEIGHTS.VERY_NEW_ACCOUNT, description: `Account created ${features.accountAgeDays} days ago (very new)` })
-    riskScore += WEIGHTS.VERY_NEW_ACCOUNT
-  } else if (features.accountAgeDays < 90) {
-    riskFactors.push({ factor: "NEW_ACCOUNT", weight: WEIGHTS.NEW_ACCOUNT, description: `Account created ${features.accountAgeDays} days ago (new)` })
-    riskScore += WEIGHTS.NEW_ACCOUNT
+  const applyRules = (rules: ProfileRiskRule[], bucket: RiskFactor[]) => {
+    for (const rule of rules) {
+      // Skip rules superseded by a more specific one that already matched.
+      if (rule.exclusiveWith && matched.has(rule.exclusiveWith)) continue
+      if (!matches(features, rule.condition)) continue
+      matched.add(rule.id)
+      bucket.push({
+        factor: rule.id,
+        weight: rule.weight,
+        description: interpolate(rule.description, features)
+      })
+      riskScore += rule.weight
+    }
   }
 
-  if (features.ownedReposCount === 0) {
-    riskFactors.push({ factor: "NO_REPOS", weight: WEIGHTS.NO_REPOS, description: "No public repositories" })
-    riskScore += WEIGHTS.NO_REPOS
-  } else if (features.ownedReposCount === 1) {
-    riskFactors.push({ factor: "SINGLE_REPO_CONTRIBUTOR", weight: WEIGHTS.SINGLE_REPO_CONTRIBUTOR, description: "Only 1 repository (potential throwaway account)" })
-    riskScore += WEIGHTS.SINGLE_REPO_CONTRIBUTOR
-  }
-
-  if (features.followers === 0) {
-    riskFactors.push({ factor: "NO_FOLLOWERS", weight: WEIGHTS.NO_FOLLOWERS, description: "Zero followers" })
-    riskScore += WEIGHTS.NO_FOLLOWERS
-  }
-
-  if (features.followerFollowingRatio > 10 && features.following > 10) {
-    riskFactors.push({ factor: "HIGH_FOLLOWING_RATIO", weight: WEIGHTS.HIGH_FOLLOWING_RATIO, description: `Following ${features.following} but only ${features.followers} followers (bot pattern)` })
-    riskScore += WEIGHTS.HIGH_FOLLOWING_RATIO
-  }
-
-  if (!features.hasProfilePhoto) {
-    riskFactors.push({ factor: "NO_PROFILE_PHOTO", weight: WEIGHTS.NO_PROFILE_PHOTO, description: "Using default avatar" })
-    riskScore += WEIGHTS.NO_PROFILE_PHOTO
-  }
-
-  if (!features.isProfileComplete) {
-    riskFactors.push({ factor: "INCOMPLETE_PROFILE", weight: WEIGHTS.INCOMPLETE_PROFILE, description: "Missing bio, name, or location" })
-    riskScore += WEIGHTS.INCOMPLETE_PROFILE
-  }
-
-  if (features.recentEventCount === 0) {
-    riskFactors.push({ factor: "NO_RECENT_ACTIVITY", weight: WEIGHTS.NO_RECENT_ACTIVITY, description: "No activity in last 90 days" })
-    riskScore += WEIGHTS.NO_RECENT_ACTIVITY
-  }
-
-  if (features.accountAgeDays >= 1095) {
-    trustSignals.push({ factor: "VERY_ESTABLISHED", weight: WEIGHTS.VERY_ESTABLISHED, description: `Account ${Math.floor(features.accountAgeDays / 365)} years old` })
-    riskScore += WEIGHTS.VERY_ESTABLISHED
-  } else if (features.accountAgeDays >= 365) {
-    trustSignals.push({ factor: "ESTABLISHED_ACCOUNT", weight: WEIGHTS.ESTABLISHED_ACCOUNT, description: `Account ${Math.floor(features.accountAgeDays / 365)} year(s) old` })
-    riskScore += WEIGHTS.ESTABLISHED_ACCOUNT
-  }
-
-  if (features.followers >= 200) {
-    trustSignals.push({ factor: "POPULAR_DEVELOPER", weight: WEIGHTS.POPULAR_DEVELOPER, description: `${features.followers} followers (popular developer)` })
-    riskScore += WEIGHTS.POPULAR_DEVELOPER
-  } else if (features.followers >= 50) {
-    trustSignals.push({ factor: "STRONG_FOLLOWER_BASE", weight: WEIGHTS.STRONG_FOLLOWER_BASE, description: `${features.followers} followers` })
-    riskScore += WEIGHTS.STRONG_FOLLOWER_BASE
-  }
-
-  if (features.ownedReposCount >= 50) {
-    trustSignals.push({ factor: "PROLIFIC_DEVELOPER", weight: WEIGHTS.PROLIFIC_DEVELOPER, description: `${features.ownedReposCount} repositories (prolific developer)` })
-    riskScore += WEIGHTS.PROLIFIC_DEVELOPER
-  } else if (features.ownedReposCount >= 10) {
-    trustSignals.push({ factor: "ACTIVE_CONTRIBUTOR", weight: WEIGHTS.ACTIVE_CONTRIBUTOR, description: `${features.ownedReposCount} repositories` })
-    riskScore += WEIGHTS.ACTIVE_CONTRIBUTOR
-  }
-
-  if (features.totalStars >= 50) {
-    trustSignals.push({ factor: "HAS_POPULAR_REPOS", weight: WEIGHTS.HAS_POPULAR_REPOS, description: `${features.totalStars} total stars across repositories` })
-    riskScore += WEIGHTS.HAS_POPULAR_REPOS
-  }
-
-  if (features.veryRecentEventCount > 0) {
-    trustSignals.push({ factor: "CONSISTENT_ACTIVITY", weight: WEIGHTS.CONSISTENT_ACTIVITY, description: `${features.veryRecentEventCount} events in last 30 days` })
-    riskScore += WEIGHTS.CONSISTENT_ACTIVITY
-  }
+  applyRules(ruleset.riskFactors, riskFactors)
+  applyRules(ruleset.trustSignals, trustSignals)
 
   riskScore = Math.max(0, Math.min(1, riskScore))
 
+  const { mediumMinScore, highMinScore, recommendations } = ruleset.riskLevels
   const riskLevel: "low" | "medium" | "high" =
-    riskScore >= 0.7 ? "high" : riskScore >= 0.4 ? "medium" : "low"
-
-  const recommendation =
-    riskLevel === "high"
-      ? "⛔ High risk profile. Exercise extreme caution. Verify identity through other channels before trusting any collaboration requests."
-      : riskLevel === "medium"
-      ? "⚠️ Moderate risk. Review profile carefully. Check repository quality and recent activity before accepting collaboration."
-      : "✅ Profile appears legitimate. Standard caution advised for any collaboration requests."
+    riskScore >= highMinScore ? "high" : riskScore >= mediumMinScore ? "medium" : "low"
 
   return {
     username: features.username,
@@ -228,7 +198,7 @@ function scoreUserProfile(features: GitHubUserFeatures): GitHubUserScanResult {
     riskScore,
     riskFactors,
     trustSignals,
-    recommendation,
+    recommendation: recommendations[riskLevel],
     profileUrl: features.profileUrl,
     accountAgeDays: features.accountAgeDays,
     followers: features.followers,

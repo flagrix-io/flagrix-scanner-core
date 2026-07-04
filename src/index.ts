@@ -21,6 +21,14 @@ export type {
   SignatureDatabase,
   RepoScanOptions,
   UserScanOptions,
+  UserProfileRuleset,
+  ProfileRiskRule,
+  ProfileCondition,
+  ProfileSimpleCondition,
+  ProfileCompoundCondition,
+  ProfileFeatureField,
+  ProfileOperator,
+  ProfileRiskLevels,
 } from "./types/index"
 
 export { RISK_THRESHOLDS, DEFAULT_DISCLAIMER } from "./types/index"
@@ -28,6 +36,7 @@ export { RISK_THRESHOLDS, DEFAULT_DISCLAIMER } from "./types/index"
 // GitHub scanners
 export { scanGitHubRepo } from "./github/repo-scanner"
 export { scanGitHubUser } from "./github/user-scanner"
+export { DEFAULT_USER_PROFILE_RULES } from "./github/user-profile-ruleset"
 
 // LinkedIn scorer
 export { scoreLinkedInProfile } from "./linkedin/profile-scorer"
