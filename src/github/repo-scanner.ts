@@ -17,6 +17,7 @@ import type {
   RepoScanOptions,
 } from "../types/index"
 import { DEFAULT_DISCLAIMER } from "../types/index"
+import { githubApiError } from "./api-error"
 import { calculateRiskScore, getRiskLevel, getSeverityWeight } from "../utils/risk-calculator"
 import { applyYaraRules, isTestFile } from "../rules/rule-matcher"
 
@@ -89,7 +90,7 @@ export async function scanGitHubRepo(
         )
       }
       if (!repoResponse.ok) {
-        throw new Error(`GitHub API error: ${repoResponse.status}`)
+        throw await githubApiError(repoResponse)
       }
       const repoData = await repoResponse.json()
       branch = repoData.default_branch || "main"
@@ -104,7 +105,7 @@ export async function scanGitHubRepo(
       )
     }
     if (!treeResponse.ok) {
-      throw new Error(`GitHub API error: ${treeResponse.status}`)
+      throw await githubApiError(treeResponse)
     }
 
     const tree: GitHubTreeResponse = await treeResponse.json()

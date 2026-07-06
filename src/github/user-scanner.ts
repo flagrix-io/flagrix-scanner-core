@@ -14,6 +14,7 @@ import type {
   UserProfileRuleset,
   UserScanOptions
 } from "../types/index"
+import { githubApiError } from "./api-error"
 import { DEFAULT_USER_PROFILE_RULES } from "./user-profile-ruleset"
 
 interface GitHubAPIUser {
@@ -62,7 +63,7 @@ async function fetchUserFeatures(
   const userResponse = await fetch(`https://api.github.com/users/${username}`, { headers })
   if (!userResponse.ok) {
     if (userResponse.status === 404) throw new Error(`User "${username}" not found`)
-    throw new Error(`GitHub API error: ${userResponse.status}`)
+    throw await githubApiError(userResponse)
   }
   const user: GitHubAPIUser = await userResponse.json()
 
@@ -70,14 +71,14 @@ async function fetchUserFeatures(
     `https://api.github.com/users/${username}/repos?per_page=100&sort=updated`,
     { headers }
   )
-  if (!reposResponse.ok) throw new Error(`Failed to fetch repositories: ${reposResponse.status}`)
+  if (!reposResponse.ok) throw await githubApiError(reposResponse, "Failed to fetch repositories")
   const repos: GitHubAPIRepo[] = await reposResponse.json()
 
   const eventsResponse = await fetch(
     `https://api.github.com/users/${username}/events/public?per_page=30`,
     { headers }
   )
-  if (!eventsResponse.ok) throw new Error(`Failed to fetch events: ${eventsResponse.status}`)
+  if (!eventsResponse.ok) throw await githubApiError(eventsResponse, "Failed to fetch events")
   const events: GitHubAPIEvent[] = await eventsResponse.json()
 
   const now = Date.now()
