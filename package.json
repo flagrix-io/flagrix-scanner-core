@@ -1,7 +1,7 @@
 {
   "name": "@flagrix/scanner-core",
   "version": "0.1.0",
-  "description": "Core security scanning logic for Flagrix — GitHub repo scanner, user profile scorer, LinkedIn scorer, PDF analyzer",
+  "description": "Core security scanning logic for Flagrix — GitHub repo scanner and user profile scorer",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",

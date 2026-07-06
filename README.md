@@ -1,6 +1,6 @@
 # @flagrix/scanner-core
 
-Open-source scanning engine behind [Flagrix](https://flagrix.io) — detects malware, backdoors, and supply-chain attacks in GitHub repositories, GitHub profiles, and PDF documents.
+Open-source scanning engine behind [Flagrix](https://flagrix.io) — detects malware, backdoors, and supply-chain attacks in GitHub repositories and GitHub profiles.
 
 Built after real-world fake-recruiter campaigns ("coding assignment" repos that steal wallets, SSH keys, and browser sessions) started targeting developers. Flagrix scans before you clone.
 
@@ -13,7 +13,6 @@ Built after real-world fake-recruiter campaigns ("coding assignment" repos that 
 - Crypto miners and credential/wallet stealers
 - Suspicious install hooks (postinstall, curl-pipe-bash)
 - Social-engineering markers and repository anomalies
-- Malicious PDFs (embedded JavaScript, auto-open actions, executable links)
 
 Signature data lives in the sibling repo [flagrix-detection-rules](https://github.com/flagrix-io/flagrix-detection-rules).
 
@@ -31,7 +30,9 @@ console.log(result.riskLevel) // "low" | "medium" | "high"
 console.log(result.findings)  // detailed findings with severity + evidence
 ```
 
-Also exported: `scanGitHubUser` (profile authenticity scoring), `scoreLinkedInProfile`, `scanPdfBytes` / `scanPdfFromUrl`, and the shared risk-calculation utilities. See [src/index.ts](src/index.ts) for the full API.
+Also exported: `scanGitHubUser` (profile authenticity scoring) and the shared risk-calculation utilities. See [src/index.ts](src/index.ts) for the full API.
+
+The package also ships standalone `scoreLinkedInProfile` and `scanPdfBytes` / `scanPdfFromUrl` scanners. These aren't wired into the current Flagrix extension (which is GitHub-only) or backed by rules in flagrix-detection-rules — they're available for anyone building on the library, but should be treated as unmaintained until that changes.
 
 ## GitHub API rate limits
 
@@ -53,7 +54,7 @@ npm run build   # tsc → dist/
 npm test        # vitest
 ```
 
-Pure TypeScript with a single runtime dependency (`franc-min` for language detection). Callers inject network and storage — the primary consumer is the Flagrix Chrome extension, which supplies `fetch` results and signature data. See [CONTRIBUTING.md](CONTRIBUTING.md) to add a detector or report a false positive.
+Pure TypeScript with a single runtime dependency (`franc-min` for language detection). Callers inject network and storage — the primary consumer is the Flagrix Chrome extension, which currently uses the GitHub repo and profile scanners and supplies `fetch` results and signature data. See [CONTRIBUTING.md](CONTRIBUTING.md) to add a detector or report a false positive.
 
 ## Disclaimer
 
