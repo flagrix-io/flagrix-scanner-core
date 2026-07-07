@@ -246,7 +246,7 @@ export async function scanGitHubRepo(
     patternsMatched += integrityFindings.length
 
     const riskScore = calculateRiskScore(findings)
-    const riskLevel = getRiskLevel(riskScore)
+    const riskLevel = getRiskLevel(riskScore, findings)
 
     return {
       riskScore,

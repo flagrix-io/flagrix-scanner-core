@@ -58,4 +58,18 @@ describe("getRiskLevel", () => {
     expect(getRiskLevel(0.8)).toBe("high")
     expect(getRiskLevel(1)).toBe("high")
   })
+
+  it("forces high when any finding is critical, even if the score is medium", () => {
+    // A lone keylogger/backdoor in an otherwise-small repo (score 0.4) must
+    // never soften to "review before cloning".
+    expect(getRiskLevel(0.4, [finding("critical")])).toBe("high")
+  })
+
+  it("ignores the floor when no finding is critical", () => {
+    expect(getRiskLevel(0.4, [finding("high"), finding("medium")])).toBe("medium")
+  })
+
+  it("still applies normal thresholds when findings is omitted", () => {
+    expect(getRiskLevel(0.4)).toBe("medium")
+  })
 })

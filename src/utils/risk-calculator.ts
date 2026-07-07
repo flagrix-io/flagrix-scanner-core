@@ -20,7 +20,15 @@ export function calculateRiskScore(findings: GitHubFinding[]): number {
   return Math.min(1, score)
 }
 
-export function getRiskLevel(score: number): RiskLevel {
+/**
+ * A single `critical` finding (code-execution / credential-theft patterns —
+ * see CONTRIBUTING.md) always means "high", regardless of how the additive
+ * score lands. Otherwise a lone keylogger or backdoor in an unlucky
+ * low-file-count repo could average out to "medium" just because nothing
+ * else was flagged alongside it.
+ */
+export function getRiskLevel(score: number, findings?: GitHubFinding[]): RiskLevel {
+  if (findings?.some((f) => f.severity === "critical")) return "high"
   if (score < RISK_THRESHOLDS.low) return "low"
   if (score < RISK_THRESHOLDS.high) return "medium"
   return "high"

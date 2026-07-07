@@ -44,7 +44,7 @@ await scanGitHubRepo(repo, { signatures, githubToken })
 
 ## Risk scoring
 
-Findings are weighted by severity (`critical` 0.4, `high` 0.25, `medium` 0.15, `low` 0.05, `info` 0.01), summed, and capped at 1.0. `getRiskLevel` maps the score to a level using the shared `RISK_THRESHOLDS` (`< 0.3` low, `< 0.6` medium, otherwise high). The GitHub **user** scanner uses its own tuned thresholds because profile signals (account age, follower ratios) distribute differently from code findings.
+Findings are weighted by severity (`critical` 0.4, `high` 0.25, `medium` 0.15, `low` 0.05, `info` 0.01), summed, and capped at 1.0. `getRiskLevel` maps the score to a level using the shared `RISK_THRESHOLDS` (`< 0.3` low, `< 0.6` medium, otherwise high) — with one override: a single `critical` finding always forces `high`, since a lone backdoor or keylogger shouldn't average down to "review before cloning" just because nothing else in the repo was flagged. Pass `findings` as the scanner does (`getRiskLevel(score, findings)`) to get this floor; omit it to fall back to threshold-only scoring. The GitHub **user** scanner uses its own tuned thresholds because profile signals (account age, follower ratios) distribute differently from code findings.
 
 ## Development
 
