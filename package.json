@@ -8,18 +8,40 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "security",
+    "malware-detection",
+    "supply-chain-security",
+    "scam-detection",
+    "github",
+    "scanner"
+  ],
+  "homepage": "https://flagrix.io",
   "repository": {
     "type": "git",
-    "url": "https://github.com/flagrix-io/flagrix-scanner-core"
+    "url": "git+https://github.com/flagrix-io/flagrix-scanner-core.git"
   },
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {
     "franc-min": "^6.2.0"
