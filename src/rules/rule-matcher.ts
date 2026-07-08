@@ -1,4 +1,5 @@
 import type { GitHubFinding, YaraRule } from "../types/index"
+import { collectEvidence } from "../utils/evidence"
 
 // Test file patterns — skip or reduce severity for these paths
 const TEST_FILE_PATTERNS = [
@@ -47,6 +48,7 @@ export function applyYaraRules(
           file: filePath,
           pattern: rule.id,
           description: rule.description,
+          evidence: collectEvidence(content, regex),
         })
       }
     } catch {

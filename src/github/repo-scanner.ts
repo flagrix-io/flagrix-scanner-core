@@ -17,6 +17,7 @@ import type {
   RepoScanOptions,
 } from "../types/index"
 import { DEFAULT_DISCLAIMER } from "../types/index"
+import { collectEvidence } from "../utils/evidence"
 import { githubApiError } from "./api-error"
 import { calculateRiskScore, getRiskLevel, getSeverityWeight } from "../utils/risk-calculator"
 import { applyYaraRules, isTestFile } from "../rules/rule-matcher"
@@ -819,11 +820,13 @@ function detectHardcodedSecrets(content: string, filePath: string): GitHubFindin
   ]
 
   const foundSecrets: Array<{ type: string; match: string; severity: "critical" | "high" }> = []
+  const matchedRegexes: RegExp[] = []
 
   for (const { pattern, type, severity } of secretPatterns) {
     const matches = content.match(pattern)
     if (matches && matches.length > 0) {
       foundSecrets.push({ type, match: matches[0].substring(0, 50) + "...", severity })
+      matchedRegexes.push(pattern)
     }
   }
 
@@ -834,6 +837,7 @@ function detectHardcodedSecrets(content: string, filePath: string): GitHubFindin
       type: "HARDCODED_SECRETS",
       file: filePath,
       description: `Hardcoded credentials detected: ${foundSecrets.map((s) => s.type).join(", ")}`,
+      evidence: collectEvidence(content, matchedRegexes),
       codeSnippet: foundSecrets[0]!.match,
       codeExplanation:
         "🔐 Hardcoded credentials expose your application to unauthorized access. API keys, passwords, and tokens should NEVER be committed to source code. Use environment variables or secure credential management instead.",
@@ -876,6 +880,7 @@ function detectNetworkPatterns(content: string, filePath: string): GitHubFinding
           type: "NETWORK_COMMUNICATION",
           file: filePath,
           description: `Suspicious network communication detected: ${type} (${validMatches.length} occurrence${validMatches.length > 1 ? "s" : ""})`,
+          evidence: collectEvidence(content, pattern),
           codeSnippet: validMatches.slice(0, 3).join("\n"),
           codeExplanation: `🌐 ${type} detected. ${
             type === "Discord Webhook"
@@ -924,6 +929,7 @@ function detectCryptoMining(content: string, filePath: string): GitHubFinding[] 
       type: "CRYPTO_MINER",
       file: filePath,
       description: `Cryptocurrency mining code detected: ${miningIndicators.slice(0, 3).join(", ")}`,
+      evidence: collectEvidence(content, miningPatterns),
       codeSnippet: matches.slice(0, 2).join("\n"),
       codeExplanation:
         "⛏️ Cryptocurrency miners use your CPU/GPU to mine coins for attackers. This drastically slows down your system and increases electricity costs. Miners are often bundled with legitimate software.",
@@ -948,11 +954,13 @@ function detectDataExfiltration(content: string, filePath: string): GitHubFindin
   ]
 
   const detectedPatterns: string[] = []
+  const matchedRegexes: RegExp[] = []
   let highestSeverity: "critical" | "high" | "medium" = "medium"
 
   for (const { pattern, type, severity } of exfiltrationPatterns) {
     if (pattern.test(content)) {
       detectedPatterns.push(type)
+      matchedRegexes.push(pattern)
       if (severity === "critical" || (severity === "high" && highestSeverity !== "critical")) {
         highestSeverity = severity
       }
@@ -965,6 +973,7 @@ function detectDataExfiltration(content: string, filePath: string): GitHubFindin
       type: "DATA_EXFILTRATION",
       file: filePath,
       description: `Data exfiltration patterns detected: ${detectedPatterns.join(", ")}`,
+      evidence: collectEvidence(content, matchedRegexes),
       codeExplanation:
         "🕵️ This code accesses sensitive user data. Combined with network requests, this could indicate credential theft or data exfiltration to attacker's servers.",
     })
@@ -995,6 +1004,7 @@ function detectBackdoors(content: string, filePath: string): GitHubFinding[] {
         description: `Backdoor detected: ${type}`,
         codeSnippet: matches[0],
         codeExplanation: `🚪 ${type} - This code allows remote attackers to execute arbitrary commands or bypass authentication. This is a CRITICAL security vulnerability.`,
+        evidence: collectEvidence(content, pattern),
       })
     }
   }
@@ -1070,6 +1080,7 @@ function detectSuspiciousFileAccess(content: string, filePath: string): GitHubFi
         description: `Suspicious file access detected: ${type}`,
         codeSnippet: matches[0],
         codeExplanation: `📁 ${type} - This code attempts to access or modify sensitive system files. This could be credential theft, system compromise, or destructive malware.`,
+        evidence: collectEvidence(content, pattern),
       })
     }
   }

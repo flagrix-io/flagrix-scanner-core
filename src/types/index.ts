@@ -88,6 +88,15 @@ export interface GitHubFinding {
   files?: string[]
   codeSnippet?: string
   codeExplanation?: string
+  /** Matched source lines in `file`, for display and `#L<n>` deep links. */
+  evidence?: FindingEvidence[]
+}
+
+export interface FindingEvidence {
+  /** 1-based line number in the finding's `file`. */
+  line: number
+  /** The trimmed source line (length-capped). */
+  code: string
 }
 
 export interface GitHubScanResult extends RiskAssessment {

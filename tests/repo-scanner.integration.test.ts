@@ -116,6 +116,11 @@ describe("scanGitHubRepo integration", () => {
     const exfil = result.findings.find((f) => f.type === "DATA_EXFILTRATION")
     expect(exfil).toBeDefined()
     expect(exfil!.severity).toBe("critical")
+    // Evidence pinpoints the matched lines for display and #L deep links.
+    expect(exfil!.evidence).toEqual([
+      { line: 2, code: "const c = document.cookie" },
+      { line: 3, code: `document.addEventListener("keydown", (e) => console.log(e.key))` }
+    ])
   })
 
   it("flags a supply-chain postinstall that fetches over the network", async () => {

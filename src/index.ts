@@ -8,6 +8,7 @@ export type {
   ScanDepth,
   GitHubRepoInfo,
   GitHubFinding,
+  FindingEvidence,
   GitHubScanResult,
   GitHubUserFeatures,
   GitHubUserScanResult,
