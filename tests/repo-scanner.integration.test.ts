@@ -246,6 +246,33 @@ describe("obfuscation signal dedupe + rule thresholds", () => {
   })
 })
 
+describe("self-scan guardrail (regex literals are inert data)", () => {
+  it("does not flag a file of detector-style regex definitions", async () => {
+    const result = await scan({
+      // The shape of this scanner's own source: regexes DESCRIBING malicious
+      // patterns, plus regex-based detection tables.
+      "src/detectors.ts": [
+        `const exfil = [`,
+        `  { pattern: /(?:addEventListener|on)\\s*\\(\\s*['"](?:keydown|keypress|keyup)['"]/gi, type: "Keylogger" },`,
+        `  { pattern: /document\\.cookie/gi, type: "Cookie Access" },`,
+        `]`,
+        `const mining = /coinhive|monero|stratum\\+tcp/gi`,
+        `const backdoor = /(?:password|auth)\\s*(?:===?|==)\\s*['"][^'"]{0,20}['"]\\s*\\)/gi`,
+        `export { exfil, mining, backdoor }`
+      ].join("\n")
+    })
+    expect(result.findings).toHaveLength(0)
+    expect(result.riskLevel).toBe("low")
+  })
+
+  it("still flags the same signals as real calls", async () => {
+    const result = await scan({
+      "src/payload.js": `document.addEventListener("keydown", (e) => log(e.key))\nconst c = document.cookie\n`
+    })
+    expect(result.findings.find((f) => f.type === "DATA_EXFILTRATION")).toBeDefined()
+  })
+})
+
 describe("hardcoded-IP detection (false-positive guardrails)", () => {
   it("does not flag invalid or over-long dotted numbers as IPs", async () => {
     const result = await scan({

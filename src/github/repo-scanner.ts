@@ -18,6 +18,7 @@ import type {
 } from "../types/index.js"
 import { DEFAULT_DISCLAIMER } from "../types/index.js"
 import { collectEvidence } from "../utils/evidence.js"
+import { maskRegexLiterals } from "../utils/mask.js"
 import { githubApiError } from "./api-error.js"
 import { calculateRiskScore, getRiskLevel, getSeverityWeight } from "../utils/risk-calculator.js"
 import { applyYaraRules, isTestFile } from "../rules/rule-matcher.js"
@@ -184,8 +185,15 @@ export async function scanGitHubRepo(
       const fileData = await contentResponse.json()
       const content = atob(fileData.content || "")
 
+      // In JS/TS, blank out regex-literal interiors before pattern matching:
+      // a regex *describing* a malicious pattern is inert data, and matching
+      // it would flag every security tool, linter, and tutorial repo
+      // (including this scanner's own source). Masking preserves offsets so
+      // evidence line numbers stay true; strings/comments stay scannable.
+      const matchable = /\.(?:js|ts)$/.test(file.path) ? maskRegexLiterals(content) : content
+
       if (SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext))) {
-        fileContents.push({ path: file.path, content })
+        fileContents.push({ path: file.path, content: matchable })
       }
 
       if (file.path.endsWith("package.json")) {
@@ -206,11 +214,11 @@ export async function scanGitHubRepo(
       }
 
       if (SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext))) {
-        const yaraFindings = applyYaraRules(content, yaraRules, file.path)
+        const yaraFindings = applyYaraRules(matchable, yaraRules, file.path)
         findings.push(...yaraFindings)
         patternsMatched += yaraFindings.length
 
-        const obfuscationFindings = detectObfuscation(content, file.path, loadedRuleIds)
+        const obfuscationFindings = detectObfuscation(matchable, file.path, loadedRuleIds)
         findings.push(...obfuscationFindings)
         patternsMatched += obfuscationFindings.length
       }
@@ -265,7 +273,11 @@ export async function scanGitHubRepo(
       }
     }
 
-    const integrityFindings = await detectCodeIntegrityIssues(fileContents, repo)
+    // Pass every path in the tree (not just scanned source) so the
+    // LICENSE/README presence checks see non-code files — otherwise they
+    // false-positive on every repo.
+    const allPaths = tree.tree.filter((i) => i.type === "blob").map((i) => i.path)
+    const integrityFindings = await detectCodeIntegrityIssues(fileContents, allPaths, repo)
     findings.push(...integrityFindings)
     patternsMatched += integrityFindings.length
 
@@ -1149,6 +1161,7 @@ function detectSuspiciousFileAccess(
 
 async function detectCodeIntegrityIssues(
   files: Array<{ path: string; content: string }>,
+  allPaths: string[],
   _repo: GitHubRepoInfo
 ): Promise<GitHubFinding[]> {
   const findings: GitHubFinding[] = []
@@ -1177,8 +1190,11 @@ async function detectCodeIntegrityIssues(
     }
   }
 
-  const hasLicense = files.some((f) => /^LICENSE|^COPYING/i.test(f.path))
-  if (!hasLicense && files.length > 5) {
+  // Presence checks run against the full tree — LICENSE/README aren't in the
+  // scanned-source list (wrong extension) and would otherwise always "miss".
+  const basename = (p: string) => p.split("/").pop() ?? p
+  const hasLicense = allPaths.some((p) => /^(LICENSE|COPYING)/i.test(basename(p)))
+  if (!hasLicense && allPaths.length > 5) {
     findings.push({
       severity: "low",
       type: "CODE_INTEGRITY_ISSUE",
@@ -1188,8 +1204,8 @@ async function detectCodeIntegrityIssues(
     })
   }
 
-  const hasReadme = files.some((f) => /^README/i.test(f.path))
-  if (!hasReadme && files.length > 5) {
+  const hasReadme = allPaths.some((p) => /^README/i.test(basename(p)))
+  if (!hasReadme && allPaths.length > 5) {
     findings.push({
       severity: "low",
       type: "CODE_INTEGRITY_ISSUE",
