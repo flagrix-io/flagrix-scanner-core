@@ -1,5 +1,5 @@
-import type { GitHubFinding, RiskLevel } from "../types/index"
-import { RISK_THRESHOLDS } from "../types/index"
+import type { GitHubFinding, RiskLevel } from "../types/index.js"
+import { RISK_THRESHOLDS } from "../types/index.js"
 
 export function getSeverityWeight(severity: GitHubFinding["severity"]): number {
   const weights: Record<GitHubFinding["severity"], number> = {

@@ -1,5 +1,5 @@
-import type { GitHubFinding, YaraRule } from "../types/index"
-import { collectEvidence } from "../utils/evidence"
+import type { GitHubFinding, YaraRule } from "../types/index.js"
+import { collectEvidence } from "../utils/evidence.js"
 
 // Test file patterns — skip or reduce severity for these paths
 const TEST_FILE_PATTERNS = [

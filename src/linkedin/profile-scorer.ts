@@ -10,8 +10,8 @@ import type {
   LinkedInScanResult,
   RiskFactor,
   RiskLevel,
-} from "../types/index"
-import { DEFAULT_DISCLAIMER, RISK_THRESHOLDS } from "../types/index"
+} from "../types/index.js"
+import { DEFAULT_DISCLAIMER, RISK_THRESHOLDS } from "../types/index.js"
 
 export function scoreLinkedInProfile(
   features: LinkedInProfileFeatures

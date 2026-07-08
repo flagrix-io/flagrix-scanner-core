@@ -13,9 +13,9 @@ import type {
   RiskFactor,
   UserProfileRuleset,
   UserScanOptions
-} from "../types/index"
-import { githubApiError } from "./api-error"
-import { DEFAULT_USER_PROFILE_RULES } from "./user-profile-ruleset"
+} from "../types/index.js"
+import { githubApiError } from "./api-error.js"
+import { DEFAULT_USER_PROFILE_RULES } from "./user-profile-ruleset.js"
 
 interface GitHubAPIUser {
   login: string

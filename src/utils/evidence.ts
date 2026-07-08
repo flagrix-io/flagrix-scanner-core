@@ -1,4 +1,4 @@
-import type { FindingEvidence } from "../types/index"
+import type { FindingEvidence } from "../types/index.js"
 
 const MAX_EVIDENCE_LINES = 3
 const MAX_LINE_LENGTH = 160

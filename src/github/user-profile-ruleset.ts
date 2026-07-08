@@ -9,7 +9,7 @@
  * `tests/user-scanner.test.ts` pins the scoring so drift is caught.
  */
 
-import type { UserProfileRuleset } from "../types/index"
+import type { UserProfileRuleset } from "../types/index.js"
 
 export const DEFAULT_USER_PROFILE_RULES: UserProfileRuleset = {
   riskFactors: [

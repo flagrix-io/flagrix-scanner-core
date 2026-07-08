@@ -15,12 +15,12 @@ import type {
   GitHubScanResult,
   MaliciousPackage,
   RepoScanOptions,
-} from "../types/index"
-import { DEFAULT_DISCLAIMER } from "../types/index"
-import { collectEvidence } from "../utils/evidence"
-import { githubApiError } from "./api-error"
-import { calculateRiskScore, getRiskLevel, getSeverityWeight } from "../utils/risk-calculator"
-import { applyYaraRules, isTestFile } from "../rules/rule-matcher"
+} from "../types/index.js"
+import { DEFAULT_DISCLAIMER } from "../types/index.js"
+import { collectEvidence } from "../utils/evidence.js"
+import { githubApiError } from "./api-error.js"
+import { calculateRiskScore, getRiskLevel, getSeverityWeight } from "../utils/risk-calculator.js"
+import { applyYaraRules, isTestFile } from "../rules/rule-matcher.js"
 
 // High-risk files to always check
 const PRIORITY_FILES = [
