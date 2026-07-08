@@ -96,7 +96,25 @@ export async function scanGitHubRepo(
       branch = repoData.default_branch || "main"
     }
 
-    const treeUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/git/trees/${branch}?recursive=1`
+    // Pin the scan to the branch's current commit so the whole read — tree
+    // and every file — is one immutable snapshot. Without this, the repo can
+    // change between requests (or between scan and clone) while the verdict
+    // silently keeps referring to content nobody can see anymore (TOCTOU).
+    const commitResponse = await fetch(
+      `https://api.github.com/repos/${repo.owner}/${repo.repo}/commits/${encodeURIComponent(branch)}`,
+      { headers }
+    )
+    if (commitResponse.status === 404 && !options.githubToken) {
+      throw new Error(
+        "This appears to be a private repository. To scan private repos, add a GitHub personal access token in Flagrix settings."
+      )
+    }
+    if (!commitResponse.ok) {
+      throw await githubApiError(commitResponse)
+    }
+    const commitSha: string = (await commitResponse.json()).sha
+
+    const treeUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/git/trees/${commitSha}?recursive=1`
     const treeResponse = await fetch(treeUrl, { headers })
 
     if (treeResponse.status === 404 && !options.githubToken) {
@@ -152,7 +170,7 @@ export async function scanGitHubRepo(
     for (const file of filesToScan) {
       filesScanned++
 
-      const contentUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${file.path}?ref=${branch}`
+      const contentUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${file.path}?ref=${commitSha}`
       const contentResponse = await fetch(contentUrl, { headers })
 
       if (!contentResponse.ok) continue
@@ -258,6 +276,7 @@ export async function scanGitHubRepo(
       })),
       disclaimer: DEFAULT_DISCLAIMER,
       repo,
+      commitSha,
       scanSummary: { filesScanned, patternsMatched, dependenciesChecked },
       findings,
       safeToClone: riskLevel === "low",

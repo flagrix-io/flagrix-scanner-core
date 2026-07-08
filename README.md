@@ -28,7 +28,10 @@ const result = await scanGitHubRepo(
 
 console.log(result.riskLevel) // "low" | "medium" | "high"
 console.log(result.findings)  // detailed findings with severity + evidence
+console.log(result.commitSha) // the exact commit the verdict applies to
 ```
+
+Scans are pinned: the branch is resolved to a commit SHA up front and every file is read at that SHA, so a push mid-scan (or between scan and clone) can't invalidate the verdict silently — compare `commitSha` against the head you actually check out.
 
 Also exported: `scanGitHubUser` (profile authenticity scoring) and the shared risk-calculation utilities. See [src/index.ts](src/index.ts) for the full API.
 

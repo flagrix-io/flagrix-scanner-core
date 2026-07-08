@@ -18,6 +18,8 @@ const EMPTY_SIGNATURES: SignatureDatabase = {
   knownBadHashes: []
 }
 
+const MOCK_COMMIT_SHA = "0123456789abcdef0123456789abcdef01234567"
+
 /** Build a fetch mock that serves an in-memory file tree as the GitHub API. */
 function mockGitHubApi(files: Record<string, string>) {
   return vi.fn(async (input: RequestInfo | URL) => {
@@ -25,6 +27,9 @@ function mockGitHubApi(files: Record<string, string>) {
 
     if (url.includes("api.npmjs.org")) {
       return new Response(JSON.stringify({ downloads: 500_000 }), { status: 200 })
+    }
+    if (/\/commits\/[^/]+$/.test(url)) {
+      return new Response(JSON.stringify({ sha: MOCK_COMMIT_SHA }), { status: 200 })
     }
     if (url.includes("/git/trees/")) {
       const tree = Object.keys(files).map((path) => ({
@@ -74,6 +79,25 @@ describe("scanGitHubRepo integration", () => {
     expect(result.findings).toHaveLength(0)
     expect(result.safeToClone).toBe(true)
     expect(result.scanSummary.filesScanned).toBe(1)
+  })
+
+  it("pins the whole scan to one commit SHA (TOCTOU)", async () => {
+    global.fetch = mockGitHubApi({
+      "src/index.js": `export const x = 1\n`
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+
+    // The verdict carries the scanned commit…
+    expect(result.commitSha).toBe(MOCK_COMMIT_SHA)
+
+    // …and every tree/content request was made against that SHA, never the
+    // mutable branch name.
+    const urls = (global.fetch as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]))
+    const treeUrl = urls.find((u) => u.includes("/git/trees/"))
+    expect(treeUrl).toContain(`/git/trees/${MOCK_COMMIT_SHA}`)
+    for (const u of urls.filter((u) => u.includes("/contents/"))) {
+      expect(u).toContain(`ref=${MOCK_COMMIT_SHA}`)
+    }
   })
 
   it("flags a critical backdoor (hardcoded auth bypass)", async () => {

@@ -92,6 +92,13 @@ export interface GitHubFinding {
 
 export interface GitHubScanResult extends RiskAssessment {
   repo: GitHubRepoInfo
+  /**
+   * The commit the verdict applies to. Every file read during the scan is
+   * pinned to this SHA, so the assessment can't straddle a push (TOCTOU) —
+   * and consumers should surface it: a verdict is a statement about this
+   * commit, not about whatever the branch points to later.
+   */
+  commitSha?: string
   scanSummary: {
     filesScanned: number
     patternsMatched: number
