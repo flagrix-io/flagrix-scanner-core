@@ -165,6 +165,11 @@ export async function scanGitHubRepo(
 
     const maliciousPackages = options.signatures.maliciousPackages
     const yaraRules = options.signatures.yaraRules
+    // Rule ids present in the loaded signatures — built-in checks with a
+    // data-driven twin yield to it, so one signal is never counted twice
+    // (see BUILTIN_OBFUSCATION_RULE_IDS and the ruleId fields on the
+    // pattern tables in the detectors below).
+    const loadedRuleIds: ReadonlySet<string> = new Set(yaraRules.map((r) => r.id))
 
     const fileContents: Array<{ path: string; content: string }> = []
 
@@ -205,7 +210,7 @@ export async function scanGitHubRepo(
         findings.push(...yaraFindings)
         patternsMatched += yaraFindings.length
 
-        const obfuscationFindings = detectObfuscation(content, file.path)
+        const obfuscationFindings = detectObfuscation(content, file.path, loadedRuleIds)
         findings.push(...obfuscationFindings)
         patternsMatched += obfuscationFindings.length
       }
@@ -219,27 +224,27 @@ export async function scanGitHubRepo(
 
     // Comprehensive security checks
     for (const file of fileContents) {
-      const secretFindings = detectHardcodedSecrets(file.content, file.path)
+      const secretFindings = detectHardcodedSecrets(file.content, file.path, loadedRuleIds)
       findings.push(...secretFindings)
       patternsMatched += secretFindings.length
 
-      const networkFindings = detectNetworkPatterns(file.content, file.path)
+      const networkFindings = detectNetworkPatterns(file.content, file.path, loadedRuleIds)
       findings.push(...networkFindings)
       patternsMatched += networkFindings.length
 
-      const miningFindings = detectCryptoMining(file.content, file.path)
+      const miningFindings = detectCryptoMining(file.content, file.path, loadedRuleIds)
       findings.push(...miningFindings)
       patternsMatched += miningFindings.length
 
-      const exfiltrationFindings = detectDataExfiltration(file.content, file.path)
+      const exfiltrationFindings = detectDataExfiltration(file.content, file.path, loadedRuleIds)
       findings.push(...exfiltrationFindings)
       patternsMatched += exfiltrationFindings.length
 
-      const backdoorFindings = detectBackdoors(file.content, file.path)
+      const backdoorFindings = detectBackdoors(file.content, file.path, loadedRuleIds)
       findings.push(...backdoorFindings)
       patternsMatched += backdoorFindings.length
 
-      const fileAccessFindings = detectSuspiciousFileAccess(file.content, file.path)
+      const fileAccessFindings = detectSuspiciousFileAccess(file.content, file.path, loadedRuleIds)
       findings.push(...fileAccessFindings)
       patternsMatched += fileAccessFindings.length
 
@@ -410,13 +415,36 @@ function scanPythonDeps(
 
 // ─── Obfuscation detection ────────────────────────────────────────────────────
 
-function detectObfuscation(content: string, filePath: string): GitHubFinding[] {
+/**
+ * Built-in obfuscation checks and their data-driven twins in
+ * flagrix-detection-rules (rules/github/obfuscation.yaml). When the loaded
+ * signatures ship a rule, the rule owns the signal and the built-in check is
+ * skipped — otherwise the same base64 blob (etc.) is flagged twice and the
+ * double-counted weight inflates the risk score. The built-ins remain as the
+ * fallback for signature sets that lack these rules.
+ */
+const BUILTIN_OBFUSCATION_RULE_IDS = {
+  base64: "OBF_BASE64_HEAVY",
+  hex: "OBF_HEX_STRINGS",
+  eval: "OBF_EVAL",
+  newFunction: "OBF_NEW_FUNCTION",
+  timerString: "OBF_SETTIMEOUT_STRING",
+  longLine: "OBF_LONG_LINE"
+} as const
+
+function detectObfuscation(
+  content: string,
+  filePath: string,
+  coveredRuleIds: ReadonlySet<string> = new Set()
+): GitHubFinding[] {
   const findings: GitHubFinding[] = []
 
   if (isTestFile(filePath)) return findings
 
   // Heavy Base64 usage
-  const base64Matches = content.match(/[A-Za-z0-9+/]{50,}={0,2}/g)
+  const base64Matches = coveredRuleIds.has(BUILTIN_OBFUSCATION_RULE_IDS.base64)
+    ? null
+    : content.match(/[A-Za-z0-9+/]{50,}={0,2}/g)
   if (base64Matches && base64Matches.length > 5) {
     const snippet =
       base64Matches.slice(0, 3).join("\n") + (base64Matches.length > 3 ? "\n... and more" : "")
@@ -432,7 +460,9 @@ function detectObfuscation(content: string, filePath: string): GitHubFinding[] {
   }
 
   // Hex-encoded strings
-  const hexMatches = content.match(/\\x[0-9a-fA-F]{2}/g)
+  const hexMatches = coveredRuleIds.has(BUILTIN_OBFUSCATION_RULE_IDS.hex)
+    ? null
+    : content.match(/\\x[0-9a-fA-F]{2}/g)
   if (hexMatches && hexMatches.length > 20) {
     findings.push({
       severity: "medium",
@@ -447,11 +477,11 @@ function detectObfuscation(content: string, filePath: string): GitHubFinding[] {
 
   // eval/Function constructor abuse
   const evalPatterns = [
-    { pattern: /eval\s*\([^)]{0,200}\)/gi, name: "eval" },
-    { pattern: /new\s+Function\s*\([^)]{0,200}\)/gi, name: "Function constructor" },
-    { pattern: /setTimeout\s*\(\s*["'`][^"'`]{0,200}["'`]/gi, name: "setTimeout with string" },
-    { pattern: /setInterval\s*\(\s*["'`][^"'`]{0,200}["'`]/gi, name: "setInterval with string" },
-  ]
+    { pattern: /eval\s*\([^)]{0,200}\)/gi, name: "eval", ruleId: BUILTIN_OBFUSCATION_RULE_IDS.eval },
+    { pattern: /new\s+Function\s*\([^)]{0,200}\)/gi, name: "Function constructor", ruleId: BUILTIN_OBFUSCATION_RULE_IDS.newFunction },
+    { pattern: /setTimeout\s*\(\s*["'`][^"'`]{0,200}["'`]/gi, name: "setTimeout with string", ruleId: BUILTIN_OBFUSCATION_RULE_IDS.timerString },
+    { pattern: /setInterval\s*\(\s*["'`][^"'`]{0,200}["'`]/gi, name: "setInterval with string", ruleId: BUILTIN_OBFUSCATION_RULE_IDS.timerString },
+  ].filter(({ ruleId }) => !coveredRuleIds.has(ruleId))
 
   for (const { pattern, name } of evalPatterns) {
     const matches = content.match(pattern)
@@ -485,7 +515,9 @@ function detectObfuscation(content: string, filePath: string): GitHubFinding[] {
     /fromCharCode/i,
   ]
 
-  const lines = content.split("\n")
+  const lines = coveredRuleIds.has(BUILTIN_OBFUSCATION_RULE_IDS.longLine)
+    ? []
+    : content.split("\n")
   const suspiciousLines: Array<{ lineNum: number; length: number; hasMaliciousPattern: boolean }> = []
 
   lines.forEach((line, index) => {
@@ -800,24 +832,28 @@ function detectSuspiciousPackageNames(content: string, filePath: string): GitHub
   return findings
 }
 
-function detectHardcodedSecrets(content: string, filePath: string): GitHubFinding[] {
+function detectHardcodedSecrets(
+  content: string,
+  filePath: string,
+  coveredRuleIds: ReadonlySet<string> = new Set()
+): GitHubFinding[] {
   const findings: GitHubFinding[] = []
 
   if (isTestFile(filePath)) return findings
 
   const secretPatterns = [
-    { pattern: /(?:api[_-]?key|apikey)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "API Key", severity: "critical" as const },
-    { pattern: /(?:secret[_-]?key|secret)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Secret Key", severity: "critical" as const },
-    { pattern: /(?:password|passwd|pwd)\s*[:=]\s*['"]([^'"]{8,})['"]/gi, type: "Password", severity: "critical" as const },
-    { pattern: /(?:token|auth[_-]?token)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Auth Token", severity: "critical" as const },
-    { pattern: /(?:private[_-]?key|privatekey)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Private Key", severity: "critical" as const },
-    { pattern: /AKIA[0-9A-Z]{16}/g, type: "AWS Access Key", severity: "critical" as const },
-    { pattern: /ghp_[a-zA-Z0-9]{36}/g, type: "GitHub Personal Access Token", severity: "critical" as const },
-    { pattern: /gho_[a-zA-Z0-9]{36}/g, type: "GitHub OAuth Token", severity: "critical" as const },
-    { pattern: /sk_live_[a-zA-Z0-9]{24,}/g, type: "Stripe Live Key", severity: "critical" as const },
-    { pattern: /(?:mongodb|mongo)[+:\/\/]{0,6}[^@\s]+:[^@\s]+@/gi, type: "MongoDB Connection String", severity: "high" as const },
-    { pattern: /postgres:\/\/[^@\s]+:[^@\s]+@/gi, type: "PostgreSQL Connection String", severity: "high" as const },
-  ]
+    { pattern: /(?:api[_-]?key|apikey)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "API Key", severity: "critical" as const, ruleId: "HARDCODED_API_KEY" },
+    { pattern: /(?:secret[_-]?key|secret)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Secret Key", severity: "critical" as const, ruleId: "HARDCODED_API_KEY" },
+    { pattern: /(?:password|passwd|pwd)\s*[:=]\s*['"]([^'"]{8,})['"]/gi, type: "Password", severity: "critical" as const, ruleId: null },
+    { pattern: /(?:token|auth[_-]?token)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Auth Token", severity: "critical" as const, ruleId: "HARDCODED_API_KEY" },
+    { pattern: /(?:private[_-]?key|privatekey)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Private Key", severity: "critical" as const, ruleId: "HARDCODED_API_KEY" },
+    { pattern: /AKIA[0-9A-Z]{16}/g, type: "AWS Access Key", severity: "critical" as const, ruleId: "HARDCODED_AWS_KEY" },
+    { pattern: /ghp_[a-zA-Z0-9]{36}/g, type: "GitHub Personal Access Token", severity: "critical" as const, ruleId: "HARDCODED_GITHUB_TOKEN" },
+    { pattern: /gho_[a-zA-Z0-9]{36}/g, type: "GitHub OAuth Token", severity: "critical" as const, ruleId: "HARDCODED_GITHUB_TOKEN" },
+    { pattern: /sk_live_[a-zA-Z0-9]{24,}/g, type: "Stripe Live Key", severity: "critical" as const, ruleId: "HARDCODED_STRIPE_KEY" },
+    { pattern: /(?:mongodb|mongo)[+:\/\/]{0,6}[^@\s]+:[^@\s]+@/gi, type: "MongoDB Connection String", severity: "high" as const, ruleId: "HARDCODED_DB_CONNECTION" },
+    { pattern: /postgres:\/\/[^@\s]+:[^@\s]+@/gi, type: "PostgreSQL Connection String", severity: "high" as const, ruleId: "HARDCODED_DB_CONNECTION" },
+  ].filter(({ ruleId }) => !ruleId || !coveredRuleIds.has(ruleId))
 
   const foundSecrets: Array<{ type: string; match: string; severity: "critical" | "high" }> = []
   const matchedRegexes: RegExp[] = []
@@ -847,7 +883,11 @@ function detectHardcodedSecrets(content: string, filePath: string): GitHubFindin
   return findings
 }
 
-function detectNetworkPatterns(content: string, filePath: string): GitHubFinding[] {
+function detectNetworkPatterns(
+  content: string,
+  filePath: string,
+  coveredRuleIds: ReadonlySet<string> = new Set()
+): GitHubFinding[] {
   const findings: GitHubFinding[] = []
 
   if (isTestFile(filePath)) return findings
@@ -857,13 +897,13 @@ function detectNetworkPatterns(content: string, filePath: string): GitHubFinding
     // dotted/number sequence (avoids flagging version strings like "1.2.3.4.5" or
     // impossible IPs like "999.999.999.999"), and excluding private/link-local ranges.
     { pattern: /(?:https?:\/\/)?(?<![\d.])(?!(?:127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.))(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?![\d.])(?::\d{1,5})?/g, type: "Hardcoded IP Address", severity: "high" as const },
-    { pattern: /https?:\/\/discord(?:app)?\.com\/api\/webhooks\/\d+\/[a-zA-Z0-9_-]+/gi, type: "Discord Webhook", severity: "critical" as const },
-    { pattern: /\d{8,10}:[a-zA-Z0-9_-]{35}/g, type: "Telegram Bot Token", severity: "high" as const },
-    { pattern: /(?:pastebin\.com|hastebin\.com|paste\.ee)\/[a-zA-Z0-9]+/gi, type: "Pastebin URL", severity: "medium" as const },
-    { pattern: /(?:bit\.ly|tinyurl\.com|t\.co)\/[a-zA-Z0-9]+/gi, type: "URL Shortener", severity: "medium" as const },
-    { pattern: /https?:\/\/[a-zA-Z0-9-]+\.(?:tk|ml|ga|cf|gq|onion|xyz)(?:\/|$)/gi, type: "Suspicious Domain TLD", severity: "high" as const },
-    { pattern: /https?:\/\/[a-zA-Z0-9-]+\.ngrok\.io/gi, type: "Ngrok Tunnel", severity: "medium" as const },
-  ]
+    { pattern: /https?:\/\/discord(?:app)?\.com\/api\/webhooks\/\d+\/[a-zA-Z0-9_-]+/gi, type: "Discord Webhook", severity: "critical" as const, ruleId: "NETWORK_DISCORD_WEBHOOK" },
+    { pattern: /\d{8,10}:[a-zA-Z0-9_-]{35}/g, type: "Telegram Bot Token", severity: "high" as const, ruleId: "NETWORK_TELEGRAM_TOKEN" },
+    { pattern: /(?:pastebin\.com|hastebin\.com|paste\.ee)\/[a-zA-Z0-9]+/gi, type: "Pastebin URL", severity: "medium" as const, ruleId: "NETWORK_PASTEBIN" },
+    { pattern: /(?:bit\.ly|tinyurl\.com|t\.co)\/[a-zA-Z0-9]+/gi, type: "URL Shortener", severity: "medium" as const, ruleId: "NETWORK_URL_SHORTENER" },
+    { pattern: /https?:\/\/[a-zA-Z0-9-]+\.(?:tk|ml|ga|cf|gq|onion|xyz)(?:\/|$)/gi, type: "Suspicious Domain TLD", severity: "high" as const, ruleId: "NETWORK_SUSPICIOUS_TLD" },
+    { pattern: /https?:\/\/[a-zA-Z0-9-]+\.ngrok\.io/gi, type: "Ngrok Tunnel", severity: "medium" as const, ruleId: "NETWORK_NGROK_TUNNEL" },
+  ].filter((p) => !("ruleId" in p) || !coveredRuleIds.has((p as { ruleId: string }).ruleId))
 
   for (const { pattern, type, severity } of suspiciousPatterns) {
     const matches = content.match(pattern)
@@ -897,8 +937,15 @@ function detectNetworkPatterns(content: string, filePath: string): GitHubFinding
   return findings
 }
 
-function detectCryptoMining(content: string, filePath: string): GitHubFinding[] {
+function detectCryptoMining(
+  content: string,
+  filePath: string,
+  coveredRuleIds: ReadonlySet<string> = new Set()
+): GitHubFinding[] {
   const findings: GitHubFinding[] = []
+
+  // The CRYPTO_MINER rule in detection-rules owns this signal when loaded.
+  if (coveredRuleIds.has("CRYPTO_MINER")) return findings
 
   const miningPatterns = [
     /coinhive|coin-hive|crypto-loot|cryptoloot|jsecoin/gi,
@@ -939,19 +986,23 @@ function detectCryptoMining(content: string, filePath: string): GitHubFinding[] 
   return findings
 }
 
-function detectDataExfiltration(content: string, filePath: string): GitHubFinding[] {
+function detectDataExfiltration(
+  content: string,
+  filePath: string,
+  coveredRuleIds: ReadonlySet<string> = new Set()
+): GitHubFinding[] {
   const findings: GitHubFinding[] = []
 
   if (isTestFile(filePath)) return findings
 
   const exfiltrationPatterns = [
-    { pattern: /navigator\.clipboard\.read(?:Text)?\s*\(/gi, type: "Clipboard Access", severity: "high" as const },
-    { pattern: /localStorage\.getItem|sessionStorage\.getItem/gi, type: "Storage Access", severity: "medium" as const },
-    { pattern: /document\.cookie/gi, type: "Cookie Access", severity: "high" as const },
-    { pattern: /(?:addEventListener|on)\s*\(\s*['"](?:keydown|keypress|keyup)['"]/gi, type: "Keylogger Pattern", severity: "critical" as const },
-    { pattern: /(?:input|password|email)[\w-]*\.value/gi, type: "Form Data Access", severity: "medium" as const },
-    { pattern: /new\s+FormData\s*\([^)]*\)[\s\S]{0,100}(?:fetch|axios|XMLHttpRequest)/gi, type: "Form Data Transmission", severity: "high" as const },
-  ]
+    { pattern: /navigator\.clipboard\.read(?:Text)?\s*\(/gi, type: "Clipboard Access", severity: "high" as const, ruleId: "EXFIL_CLIPBOARD" },
+    { pattern: /localStorage\.getItem|sessionStorage\.getItem/gi, type: "Storage Access", severity: "medium" as const, ruleId: null },
+    { pattern: /document\.cookie/gi, type: "Cookie Access", severity: "high" as const, ruleId: "EXFIL_COOKIE" },
+    { pattern: /(?:addEventListener|on)\s*\(\s*['"](?:keydown|keypress|keyup)['"]/gi, type: "Keylogger Pattern", severity: "critical" as const, ruleId: "EXFIL_KEYLOGGER" },
+    { pattern: /(?:input|password|email)[\w-]*\.value/gi, type: "Form Data Access", severity: "medium" as const, ruleId: null },
+    { pattern: /new\s+FormData\s*\([^)]*\)[\s\S]{0,100}(?:fetch|axios|XMLHttpRequest)/gi, type: "Form Data Transmission", severity: "high" as const, ruleId: null },
+  ].filter(({ ruleId }) => !ruleId || !coveredRuleIds.has(ruleId))
 
   const detectedPatterns: string[] = []
   const matchedRegexes: RegExp[] = []
@@ -982,17 +1033,21 @@ function detectDataExfiltration(content: string, filePath: string): GitHubFindin
   return findings
 }
 
-function detectBackdoors(content: string, filePath: string): GitHubFinding[] {
+function detectBackdoors(
+  content: string,
+  filePath: string,
+  coveredRuleIds: ReadonlySet<string> = new Set()
+): GitHubFinding[] {
   const findings: GitHubFinding[] = []
 
   const backdoorPatterns = [
-    { pattern: /eval\s*\(\s*(?:request|req)(?:\.|\.body|\.query)/gi, type: "Remote Code Execution Endpoint", severity: "critical" as const },
-    { pattern: /exec\s*\(\s*(?:request|req)(?:\.|\.body|\.query)/gi, type: "Command Injection Endpoint", severity: "critical" as const },
-    { pattern: /require\s*\(\s*(?:request|req)(?:\.|\.body|\.query)/gi, type: "Dynamic Require", severity: "critical" as const },
-    { pattern: /new\s+Function\s*\([^)]*(?:request|req)/gi, type: "Dynamic Function from Request", severity: "critical" as const },
-    { pattern: /(?:admin|debug|backdoor|shell)[\w]*\s*[:=]\s*(?:true|1|"[^"]*")\s*(?:\/\/|#)?\s*(?:TODO|FIXME|HACK)?/gi, type: "Debug/Admin Flag", severity: "high" as const },
-    { pattern: /(?:password|auth)\s*(?:===?|==)\s*['"][^'"]{0,20}['"]\s*\)/gi, type: "Hardcoded Auth Bypass", severity: "critical" as const },
-  ]
+    { pattern: /eval\s*\(\s*(?:request|req)(?:\.|\.body|\.query)/gi, type: "Remote Code Execution Endpoint", severity: "critical" as const, ruleId: "BACKDOOR_RCE_ENDPOINT" },
+    { pattern: /exec\s*\(\s*(?:request|req)(?:\.|\.body|\.query)/gi, type: "Command Injection Endpoint", severity: "critical" as const, ruleId: "BACKDOOR_RCE_ENDPOINT" },
+    { pattern: /require\s*\(\s*(?:request|req)(?:\.|\.body|\.query)/gi, type: "Dynamic Require", severity: "critical" as const, ruleId: "BACKDOOR_DYNAMIC_REQUIRE" },
+    { pattern: /new\s+Function\s*\([^)]*(?:request|req)/gi, type: "Dynamic Function from Request", severity: "critical" as const, ruleId: null },
+    { pattern: /(?:admin|debug|backdoor|shell)[\w]*\s*[:=]\s*(?:true|1|"[^"]*")\s*(?:\/\/|#)?\s*(?:TODO|FIXME|HACK)?/gi, type: "Debug/Admin Flag", severity: "high" as const, ruleId: null },
+    { pattern: /(?:password|auth)\s*(?:===?|==)\s*['"][^'"]{0,20}['"]\s*\)/gi, type: "Hardcoded Auth Bypass", severity: "critical" as const, ruleId: "BACKDOOR_HARDCODED_AUTH" },
+  ].filter(({ ruleId }) => !ruleId || !coveredRuleIds.has(ruleId))
 
   for (const { pattern, type, severity } of backdoorPatterns) {
     const matches = content.match(pattern)
@@ -1057,18 +1112,22 @@ function detectSupplyChainRisks(content: string, filePath: string): GitHubFindin
   return findings
 }
 
-function detectSuspiciousFileAccess(content: string, filePath: string): GitHubFinding[] {
+function detectSuspiciousFileAccess(
+  content: string,
+  filePath: string,
+  coveredRuleIds: ReadonlySet<string> = new Set()
+): GitHubFinding[] {
   const findings: GitHubFinding[] = []
 
   if (isTestFile(filePath)) return findings
 
   const fileAccessPatterns = [
-    { pattern: /(?:fs\.read|readFileSync|readFile)\s*\([^)]*(?:\.ssh|\.aws|\.gnupg|\.docker|id_rsa|credentials)/gi, type: "SSH/AWS Credentials Access", severity: "critical" as const },
-    { pattern: /(?:fs\.read|readFileSync|readFile)\s*\([^)]*(?:etc\/passwd|etc\/shadow|\.bash_history|\.zsh_history)/gi, type: "System File Access", severity: "critical" as const },
-    { pattern: /(?:fs\.read|readFileSync|readFile)\s*\([^)]*(?:Chrome|Firefox|Safari|Edge)[\w\s/\\]*(?:Cookies|Login|History)/gi, type: "Browser Data Access", severity: "critical" as const },
-    { pattern: /(?:fs\.write|writeFileSync|writeFile)\s*\([^)]*(?:\/etc|\/sys|\/bin|C:\\\\Windows)/gi, type: "System Directory Write", severity: "critical" as const },
-    { pattern: /(?:fs\.unlink|unlinkSync|rmSync|rm\s+-rf)/gi, type: "File Deletion", severity: "medium" as const },
-  ]
+    { pattern: /(?:fs\.read|readFileSync|readFile)\s*\([^)]*(?:\.ssh|\.aws|\.gnupg|\.docker|id_rsa|credentials)/gi, type: "SSH/AWS Credentials Access", severity: "critical" as const, ruleId: "FILE_ACCESS_CREDENTIALS" },
+    { pattern: /(?:fs\.read|readFileSync|readFile)\s*\([^)]*(?:etc\/passwd|etc\/shadow|\.bash_history|\.zsh_history)/gi, type: "System File Access", severity: "critical" as const, ruleId: "FILE_ACCESS_SYSTEM" },
+    { pattern: /(?:fs\.read|readFileSync|readFile)\s*\([^)]*(?:Chrome|Firefox|Safari|Edge)[\w\s/\\]*(?:Cookies|Login|History)/gi, type: "Browser Data Access", severity: "critical" as const, ruleId: "FILE_ACCESS_BROWSER_DATA" },
+    { pattern: /(?:fs\.write|writeFileSync|writeFile)\s*\([^)]*(?:\/etc|\/sys|\/bin|C:\\\\Windows)/gi, type: "System Directory Write", severity: "critical" as const, ruleId: null },
+    { pattern: /(?:fs\.unlink|unlinkSync|rmSync|rm\s+-rf)/gi, type: "File Deletion", severity: "medium" as const, ruleId: null },
+  ].filter(({ ruleId }) => !ruleId || !coveredRuleIds.has(ruleId))
 
   for (const { pattern, type, severity } of fileAccessPatterns) {
     const matches = content.match(pattern)

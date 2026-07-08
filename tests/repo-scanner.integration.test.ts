@@ -150,6 +150,102 @@ describe("scanGitHubRepo integration", () => {
   })
 })
 
+describe("obfuscation signal dedupe + rule thresholds", () => {
+  const BASE64_HEAVY_RULE = {
+    id: "OBF_BASE64_HEAVY",
+    name: "Heavy Base64 Encoding",
+    pattern: "[A-Za-z0-9+/]{50,}={0,2}",
+    description: "6+ base64 strings of 50+ chars in a single file.",
+    tags: ["base64", "obfuscation"],
+    severity: "medium" as const
+  }
+  const blob = () => "QUFB" + "a".repeat(60) // >50 base64-ish chars
+  const heavyBase64File = Array.from({ length: 7 }, (_, i) => `const c${i} = "${blob()}"`).join("\n")
+
+  it("counts a base64-heavy file once when the rule ships in signatures", async () => {
+    global.fetch = mockGitHubApi({ "src/enc.js": heavyBase64File }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, {
+      signatures: {
+        ...EMPTY_SIGNATURES,
+        yaraRules: [{ ...BASE64_HEAVY_RULE, minMatches: 6, fileExtensions: [".js", ".ts"] }]
+      }
+    })
+    const base64Findings = result.findings.filter(
+      (f) => f.pattern === "OBF_BASE64_HEAVY" || f.description.includes("Base64")
+    )
+    expect(base64Findings).toHaveLength(1)
+    expect(base64Findings[0]!.pattern).toBe("OBF_BASE64_HEAVY")
+  })
+
+  it("keeps the built-in base64 check as fallback when signatures lack the rule", async () => {
+    global.fetch = mockGitHubApi({ "src/enc.js": heavyBase64File }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+    const base64Findings = result.findings.filter((f) => f.description.includes("Base64"))
+    expect(base64Findings).toHaveLength(1)
+    expect(base64Findings[0]!.type).toBe("OBFUSCATED_CODE")
+  })
+
+  it("honors minMatches — a single base64 string is not a signal", async () => {
+    global.fetch = mockGitHubApi({
+      "src/one.js": `const key = "${blob()}"\n`
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, {
+      signatures: { ...EMPTY_SIGNATURES, yaraRules: [{ ...BASE64_HEAVY_RULE, minMatches: 6 }] }
+    })
+    expect(result.findings.filter((f) => f.pattern === "OBF_BASE64_HEAVY")).toHaveLength(0)
+  })
+
+  it("honors fileExtensions — rules scoped to code files skip others", async () => {
+    global.fetch = mockGitHubApi({ "setup.py": heavyBase64File }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, {
+      signatures: {
+        ...EMPTY_SIGNATURES,
+        yaraRules: [{ ...BASE64_HEAVY_RULE, minMatches: 6, fileExtensions: [".js"] }]
+      }
+    })
+    expect(result.findings.filter((f) => f.pattern === "OBF_BASE64_HEAVY")).toHaveLength(0)
+  })
+
+  it("dedupes exfil/backdoor signals against loaded rules (one finding per signal)", async () => {
+    const rules = [
+      { id: "EXFIL_COOKIE", name: "Cookie Access", pattern: "document\\.cookie", description: "Reads cookies", tags: ["exfiltration"], severity: "high" as const },
+      { id: "EXFIL_KEYLOGGER", name: "Keylogger", pattern: "(?:addEventListener|on)\\s*\\(\\s*['\\\"](?:keydown|keypress|keyup)['\\\"]", description: "Captures keystrokes", tags: ["exfiltration"], severity: "critical" as const },
+      { id: "BACKDOOR_HARDCODED_AUTH", name: "Auth Bypass", pattern: "(?:password|auth)\\s*(?:===?|==)\\s*['\\\"][^'\\\"]{0,20}['\\\"]\\s*\\)", description: "Hardcoded auth", tags: ["backdoor"], severity: "critical" as const }
+    ]
+    global.fetch = mockGitHubApi({
+      "src/evil.js": `const c = document.cookie\ndocument.addEventListener("keydown", g)\nif (password == "letmein") { return true }\n`
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, {
+      signatures: { ...EMPTY_SIGNATURES, yaraRules: rules }
+    })
+    // The rules own the signals — no built-in DATA_EXFILTRATION/BACKDOOR twins.
+    expect(result.findings.filter((f) => f.type === "DATA_EXFILTRATION")).toHaveLength(0)
+    expect(result.findings.filter((f) => f.type === "BACKDOOR")).toHaveLength(0)
+    const ruleHits = result.findings.filter((f) => f.type === "MALWARE_SIGNATURE").map((f) => f.pattern).sort()
+    expect(ruleHits).toEqual(["BACKDOOR_HARDCODED_AUTH", "EXFIL_COOKIE", "EXFIL_KEYLOGGER"])
+    expect(result.riskLevel).toBe("high") // critical findings still floor to high
+  })
+
+  it("medium-fixture shape stays MEDIUM: base64 + storage access + file deletion", async () => {
+    // Mirrors flagrix-io/flagrix-test-medium: with the rule shipped, the
+    // base64 signal counts once → 3 medium findings (0.45) → medium band,
+    // not the 4th duplicate that used to tip it to high (0.60).
+    global.fetch = mockGitHubApi({
+      "src/encoder.js": heavyBase64File,
+      "src/analytics.js": `const d = localStorage.getItem("k")\nconst v = input.value\n`,
+      "src/cleanup.js": `const fs = require("node:fs")\nfs.unlinkSync("/tmp/x")\n`
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, {
+      signatures: {
+        ...EMPTY_SIGNATURES,
+        yaraRules: [{ ...BASE64_HEAVY_RULE, minMatches: 6, fileExtensions: [".js", ".ts"] }]
+      }
+    })
+    expect(result.findings.every((f) => f.severity === "medium")).toBe(true)
+    expect(result.riskLevel).toBe("medium")
+  })
+})
+
 describe("hardcoded-IP detection (false-positive guardrails)", () => {
   it("does not flag invalid or over-long dotted numbers as IPs", async () => {
     const result = await scan({

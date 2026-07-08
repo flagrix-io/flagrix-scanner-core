@@ -34,9 +34,21 @@ export function applyYaraRules(
 
   for (const rule of rules) {
     try {
+      // Honor the rule's file-extension scope (default: all scanned files).
+      if (
+        rule.fileExtensions &&
+        rule.fileExtensions.length > 0 &&
+        !rule.fileExtensions.some((ext) => filePath.endsWith(ext))
+      ) {
+        continue
+      }
+
       const regex = new RegExp(rule.pattern, "gi")
       const matches = content.match(regex)
-      if (matches && matches.length > 0) {
+      // Honor the rule's match threshold (e.g. "6+ base64 strings" — a single
+      // occurrence of a legitimate encoding is not a signal).
+      const required = rule.minMatches && rule.minMatches > 1 ? rule.minMatches : 1
+      if (matches && matches.length >= required) {
         // Skip test files for non-critical patterns (reduce false positives)
         if (isTest && rule.severity !== "critical") {
           continue

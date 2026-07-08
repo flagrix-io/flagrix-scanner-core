@@ -203,6 +203,10 @@ export interface YaraRule {
   description: string
   tags: string[]
   severity: "critical" | "high" | "medium" | "low"
+  /** Minimum regex matches in one file before the rule fires (default 1). */
+  minMatches?: number
+  /** Restrict the rule to files with these extensions (default: all scanned files). */
+  fileExtensions?: string[]
 }
 
 export interface KnownBadHash {
