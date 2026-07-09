@@ -103,3 +103,66 @@ function stringEnd(line: string, start: number): number {
   }
   return line.length
 }
+
+/**
+ * Masks the interiors of string literals (including multi-line template
+ * literals) with spaces. Used for TEST FILES only: there, attack-shaped text
+ * lives in fixture strings — inputs that *prove* detectors work — while real
+ * malware in a test file is actual code, which stays fully scannable.
+ *
+ * Run AFTER maskRegexLiterals: a regex literal containing a quote (e.g.
+ * /['"]/) would otherwise poison the quote-tracking state. Comments are
+ * copied verbatim for the same reason (apostrophes in prose).
+ */
+export function maskStringLiterals(content: string): string {
+  let out = ""
+  let i = 0
+  let quote: string | null = null
+
+  while (i < content.length) {
+    const ch = content[i]!
+
+    if (quote) {
+      if (ch === "\\") {
+        out += "  " // mask escape pairs, length preserved
+        i += 2
+        continue
+      }
+      if (ch === quote) {
+        quote = null
+        out += ch
+      } else {
+        out += ch === "\n" ? "\n" : " "
+      }
+      i++
+      continue
+    }
+
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch
+      out += ch
+      i++
+      continue
+    }
+
+    if (ch === "/" && content[i + 1] === "/") {
+      let j = content.indexOf("\n", i)
+      if (j === -1) j = content.length
+      out += content.slice(i, j)
+      i = j
+      continue
+    }
+    if (ch === "/" && content[i + 1] === "*") {
+      const close = content.indexOf("*/", i + 2)
+      const j = close === -1 ? content.length : close + 2
+      out += content.slice(i, j)
+      i = j
+      continue
+    }
+
+    out += ch
+    i++
+  }
+
+  return out
+}

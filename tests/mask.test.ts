@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { maskRegexLiterals } from "../src/utils/mask.js"
+import { maskRegexLiterals, maskStringLiterals } from "../src/utils/mask.js"
 
 describe("maskRegexLiterals", () => {
   it("blanks a regex literal describing a keylogger", () => {
@@ -53,5 +53,38 @@ describe("maskRegexLiterals", () => {
   it("leaves unterminated slashes alone", () => {
     const line = `const half = 1 / 2`
     expect(maskRegexLiterals(line)).toBe(line)
+  })
+})
+
+describe("maskStringLiterals (test-file fixtures)", () => {
+  it("masks a quoted attack fixture but keeps real code", () => {
+    const content = [
+      `const fixture = "document.addEventListener(\\"keydown\\", grab)"`,
+      `document.addEventListener("keydown", spy)` // the call itself stays; only the string arg blanks
+    ].join("\n")
+    const masked = maskStringLiterals(content)
+    const lines = masked.split("\n")
+    expect(lines[0]).not.toContain("addEventListener")
+    expect(lines[1]).toContain("document.addEventListener(")
+  })
+
+  it("masks multi-line template literals and preserves line numbers", () => {
+    const content = "const f = `line one\ndocument.cookie\nline three`\nsteal()"
+    const masked = maskStringLiterals(content)
+    expect(masked.split("\n")).toHaveLength(4)
+    expect(masked).not.toContain("document.cookie")
+    expect(masked.split("\n")[3]).toBe("steal()")
+  })
+
+  it("is not derailed by apostrophes in comments", () => {
+    const content = `// don't break here\nconst c = document.cookie`
+    expect(maskStringLiterals(content)).toContain("document.cookie")
+  })
+
+  it("composes with regex masking (regexes containing quotes)", () => {
+    const content = `const re = /['"]key['"]/g\nconst s = "coinhive"`
+    const masked = maskStringLiterals(maskRegexLiterals(content))
+    expect(masked).not.toContain("coinhive")
+    expect(masked.split("\n")).toHaveLength(2)
   })
 })

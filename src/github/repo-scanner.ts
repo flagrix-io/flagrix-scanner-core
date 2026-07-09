@@ -18,7 +18,7 @@ import type {
 } from "../types/index.js"
 import { DEFAULT_DISCLAIMER } from "../types/index.js"
 import { collectEvidence } from "../utils/evidence.js"
-import { maskRegexLiterals } from "../utils/mask.js"
+import { maskRegexLiterals, maskStringLiterals } from "../utils/mask.js"
 import { githubApiError } from "./api-error.js"
 import { calculateRiskScore, getRiskLevel, getSeverityWeight } from "../utils/risk-calculator.js"
 import { applyYaraRules, isTestFile } from "../rules/rule-matcher.js"
@@ -190,7 +190,14 @@ export async function scanGitHubRepo(
       // it would flag every security tool, linter, and tutorial repo
       // (including this scanner's own source). Masking preserves offsets so
       // evidence line numbers stay true; strings/comments stay scannable.
-      const matchable = /\.(?:js|ts)$/.test(file.path) ? maskRegexLiterals(content) : content
+      const isJsTs = /\.(?:js|ts)$/.test(file.path)
+      let matchable = isJsTs ? maskRegexLiterals(content) : content
+      // In test files, string literals are fixtures — the inputs that prove
+      // detectors work — so mask those too. Real malware in a test file is
+      // actual code (the `npm test` attack) and stays fully scannable.
+      if (isJsTs && isTestFile(file.path)) {
+        matchable = maskStringLiterals(matchable)
+      }
 
       if (SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext))) {
         fileContents.push({ path: file.path, content: matchable })
@@ -489,7 +496,8 @@ function detectObfuscation(
 
   // eval/Function constructor abuse
   const evalPatterns = [
-    { pattern: /eval\s*\([^)]{0,200}\)/gi, name: "eval", ruleId: BUILTIN_OBFUSCATION_RULE_IDS.eval },
+    // Non-empty argument required: bare "eval()" appears in prose/docs.
+    { pattern: /eval\s*\(\s*[^)\s][^)]{0,200}\)/gi, name: "eval", ruleId: BUILTIN_OBFUSCATION_RULE_IDS.eval },
     { pattern: /new\s+Function\s*\([^)]{0,200}\)/gi, name: "Function constructor", ruleId: BUILTIN_OBFUSCATION_RULE_IDS.newFunction },
     { pattern: /setTimeout\s*\(\s*["'`][^"'`]{0,200}["'`]/gi, name: "setTimeout with string", ruleId: BUILTIN_OBFUSCATION_RULE_IDS.timerString },
     { pattern: /setInterval\s*\(\s*["'`][^"'`]{0,200}["'`]/gi, name: "setInterval with string", ruleId: BUILTIN_OBFUSCATION_RULE_IDS.timerString },

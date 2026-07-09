@@ -271,6 +271,35 @@ describe("self-scan guardrail (regex literals are inert data)", () => {
     })
     expect(result.findings.find((f) => f.type === "DATA_EXFILTRATION")).toBeDefined()
   })
+
+  it("relaxes string-literal fixtures in test files, but not in src/", async () => {
+    const KEYLOGGER_RULE = {
+      id: "EXFIL_KEYLOGGER",
+      name: "Keylogger",
+      pattern: `(?:addEventListener|on)\\s*\\(\\s*['"](?:keydown|keypress|keyup)['"]`,
+      description: "Keyboard event listener",
+      tags: ["keylogger"],
+      severity: "critical" as const
+    }
+    const signatures = { ...EMPTY_SIGNATURES, yaraRules: [KEYLOGGER_RULE] }
+    const fixture = `document.addEventListener("keydown", grab)`
+
+    // In a TEST file the attack shape appears in fixture strings — inert
+    // inputs that exercise detectors — so it must not fire.
+    global.fetch = mockGitHubApi({
+      "tests/detector.test.ts": "const f = `" + fixture + "`\nexpect(scan(f))\n"
+    }) as unknown as typeof fetch
+    expect((await scanGitHubRepo(repoInfo, { signatures })).findings).toHaveLength(0)
+
+    // The identical text in a SRC file is treated as real and fires. (Note:
+    // string masking is scoped to test files; this rule keys on the string
+    // argument, so relaxing test-file strings intentionally trades away
+    // detection of this pattern *within test files* — see the file loop.)
+    global.fetch = mockGitHubApi({ "src/handler.js": fixture + "\n" }) as unknown as typeof fetch
+    const src = await scanGitHubRepo(repoInfo, { signatures })
+    expect(src.findings.map((f) => f.pattern)).toContain("EXFIL_KEYLOGGER")
+    expect(src.riskLevel).toBe("high")
+  })
 })
 
 describe("hardcoded-IP detection (false-positive guardrails)", () => {
