@@ -99,6 +99,18 @@ export interface FindingEvidence {
   code: string
 }
 
+/** Why a file in the repo tree was not content-scanned. */
+export type SkipReason =
+  | "unsupported-type" // not a code/manifest file type the scanner reads
+  | "over-file-limit" // eligible, but past the per-scan file cap
+  | "too-large" // eligible, but blob exceeds the size limit
+  | "fetch-failed" // selected, but the contents API request failed
+
+export interface SkippedFile {
+  path: string
+  reason: SkipReason
+}
+
 export interface GitHubScanResult extends RiskAssessment {
   repo: GitHubRepoInfo
   /**
@@ -108,10 +120,27 @@ export interface GitHubScanResult extends RiskAssessment {
    * commit, not about whatever the branch points to later.
    */
   commitSha?: string
+  /**
+   * Sum of finding weights before the 1.0 clamp. When this exceeds 1,
+   * per-finding deductions add up to more than the displayed score —
+   * consumers can use it to label the score as "capped".
+   */
+  rawRiskScore: number
   scanSummary: {
     filesScanned: number
     patternsMatched: number
     dependenciesChecked: number
+    /** Paths whose contents were actually scanned. */
+    scannedFiles: string[]
+    /**
+     * Files in the tree that were not content-scanned, with the reason.
+     * List is capped (see MAX_SKIPPED_FILES_LISTED); `skippedCount` is the
+     * true total.
+     */
+    skippedFiles: SkippedFile[]
+    skippedCount: number
+    /** GitHub returned a partial tree (repo too large for one tree call). */
+    treeTruncated: boolean
   }
   findings: GitHubFinding[]
   safeToClone: boolean

@@ -15,12 +15,18 @@ import type {
   GitHubScanResult,
   MaliciousPackage,
   RepoScanOptions,
+  SkippedFile,
 } from "../types/index.js"
 import { DEFAULT_DISCLAIMER } from "../types/index.js"
 import { collectEvidence } from "../utils/evidence.js"
 import { maskRegexLiterals, maskStringLiterals } from "../utils/mask.js"
 import { githubApiError } from "./api-error.js"
-import { calculateRiskScore, getRiskLevel, getSeverityWeight } from "../utils/risk-calculator.js"
+import {
+  calculateRawRiskScore,
+  calculateRiskScore,
+  getRiskLevel,
+  getSeverityWeight,
+} from "../utils/risk-calculator.js"
 import { applyYaraRules, isTestFile } from "../rules/rule-matcher.js"
 
 // High-risk files to always check
@@ -35,8 +41,31 @@ const PRIORITY_FILES = [
   "Makefile",
 ]
 
-const SCANNABLE_EXTENSIONS = [".js", ".ts", ".py", ".sh", ".ps1", ".bat", ".cmd"]
-const MAX_FILES_TO_SCAN = 50
+const SCANNABLE_EXTENSIONS = [
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".ts",
+  ".tsx",
+  ".py",
+  ".rb",
+  ".php",
+  ".go",
+  ".sh",
+  ".ps1",
+  ".psm1",
+  ".bat",
+  ".cmd",
+  ".vbs",
+]
+const MAX_FILES_TO_SCAN = 200
+// Blobs above this are skipped ("too-large"): almost always bundles or
+// vendored artifacts, and fetching them dominates scan time on big repos.
+const MAX_FILE_SIZE_BYTES = 1024 * 1024
+// skippedFiles list cap — skippedCount stays accurate; this only bounds the
+// per-path detail so huge repos don't bloat the result object.
+const MAX_SKIPPED_FILES_LISTED = 500
 
 // npm download count cache (in-memory)
 interface NpmDownloadCacheEntry {
@@ -130,14 +159,33 @@ export async function scanGitHubRepo(
 
     const tree: GitHubTreeResponse = await treeResponse.json()
 
-    const filesToScan = tree.tree
-      .filter(
-        (item) =>
-          item.type === "blob" &&
-          (PRIORITY_FILES.some((pf) => item.path.endsWith(pf)) ||
-            SCANNABLE_EXTENSIONS.some((ext) => item.path.endsWith(ext)))
-      )
-      .slice(0, MAX_FILES_TO_SCAN)
+    // Partition every blob into "scan" vs "skip + why", so the UI can show
+    // exactly which files were read and why the rest were not.
+    const skippedFiles: SkippedFile[] = []
+    let skippedCount = 0
+    const skip = (path: string, reason: SkippedFile["reason"]) => {
+      skippedCount++
+      if (skippedFiles.length < MAX_SKIPPED_FILES_LISTED) {
+        skippedFiles.push({ path, reason })
+      }
+    }
+
+    const filesToScan: GitHubTreeItem[] = []
+    for (const item of tree.tree) {
+      if (item.type !== "blob") continue
+      const eligible =
+        PRIORITY_FILES.some((pf) => item.path.endsWith(pf)) ||
+        SCANNABLE_EXTENSIONS.some((ext) => item.path.endsWith(ext))
+      if (!eligible) {
+        skip(item.path, "unsupported-type")
+      } else if (item.size !== undefined && item.size > MAX_FILE_SIZE_BYTES) {
+        skip(item.path, "too-large")
+      } else if (filesToScan.length >= MAX_FILES_TO_SCAN) {
+        skip(item.path, "over-file-limit")
+      } else {
+        filesToScan.push(item)
+      }
+    }
 
     // Check for hidden files with suspicious names
     const hiddenFiles = tree.tree.filter(
@@ -173,14 +221,19 @@ export async function scanGitHubRepo(
     const loadedRuleIds: ReadonlySet<string> = new Set(yaraRules.map((r) => r.id))
 
     const fileContents: Array<{ path: string; content: string }> = []
+    const scannedFiles: string[] = []
 
     for (const file of filesToScan) {
-      filesScanned++
-
       const contentUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${file.path}?ref=${commitSha}`
       const contentResponse = await fetch(contentUrl, { headers })
 
-      if (!contentResponse.ok) continue
+      if (!contentResponse.ok) {
+        skip(file.path, "fetch-failed")
+        continue
+      }
+
+      filesScanned++
+      scannedFiles.push(file.path)
 
       const fileData = await contentResponse.json()
       const content = atob(fileData.content || "")
@@ -190,7 +243,7 @@ export async function scanGitHubRepo(
       // it would flag every security tool, linter, and tutorial repo
       // (including this scanner's own source). Masking preserves offsets so
       // evidence line numbers stay true; strings/comments stay scannable.
-      const isJsTs = /\.(?:js|ts)$/.test(file.path)
+      const isJsTs = /\.(?:[cm]?js|ts|[jt]sx)$/.test(file.path)
       let matchable = isJsTs ? maskRegexLiterals(content) : content
       // In test files, string literals are fixtures — the inputs that prove
       // detectors work — so mask those too. Real malware in a test file is
@@ -288,11 +341,13 @@ export async function scanGitHubRepo(
     findings.push(...integrityFindings)
     patternsMatched += integrityFindings.length
 
+    const rawRiskScore = calculateRawRiskScore(findings)
     const riskScore = calculateRiskScore(findings)
     const riskLevel = getRiskLevel(riskScore, findings)
 
     return {
       riskScore,
+      rawRiskScore,
       riskLevel,
       factors: findings.map((f) => ({
         factor: f.type,
@@ -302,7 +357,15 @@ export async function scanGitHubRepo(
       disclaimer: DEFAULT_DISCLAIMER,
       repo,
       commitSha,
-      scanSummary: { filesScanned, patternsMatched, dependenciesChecked },
+      scanSummary: {
+        filesScanned,
+        patternsMatched,
+        dependenciesChecked,
+        scannedFiles,
+        skippedFiles,
+        skippedCount,
+        treeTruncated: tree.truncated,
+      },
       findings,
       safeToClone: riskLevel === "low",
       scannedAt: new Date(),

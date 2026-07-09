@@ -16,6 +16,14 @@ Built after real-world fake-recruiter campaigns ("coding assignment" repos that 
 
 Signature data lives in the sibling repo [flagrix-detection-rules](https://github.com/flagrix-io/flagrix-detection-rules).
 
+## Privacy — everything runs locally
+
+All analysis happens on the caller's device — there is no Flagrix backend and no telemetry. The library's only network calls are to `api.github.com` (file contents and profile data) and `api.npmjs.org` (package download counts for typosquat checks). Nothing that gets scanned — file contents, repo names, results — is sent to Flagrix or any third-party server. The optional `githubToken` is used exclusively as an `Authorization` header on GitHub API requests; it is never transmitted anywhere else.
+
+## What gets scanned
+
+A repo scan reads code files (`.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.py`, `.rb`, `.php`, `.go`, `.sh`, `.ps1`, `.psm1`, `.bat`, `.cmd`, `.vbs`) plus dependency manifests (`package.json`, lockfiles, `requirements.txt`, `setup.py`, and similar), capped at **200 files** and **1 MB per file** per scan. Everything else — docs, images, data files, oversized blobs — is skipped, and the result says so: `scanSummary.scannedFiles` lists every file that was read, and `scanSummary.skippedFiles` lists what was skipped with a per-file reason (`unsupported-type`, `over-file-limit`, `too-large`, `fetch-failed`).
+
 ## Usage
 
 ```ts
@@ -39,7 +47,7 @@ The package also ships standalone `scoreLinkedInProfile` and `scanPdfBytes` / `s
 
 ## GitHub API rate limits
 
-`scanGitHubRepo` and `scanGitHubUser` call the GitHub REST API directly. A single repo scan issues one tree request plus up to ~50 file-content requests. Unauthenticated, GitHub allows **60 requests/hour** — enough for a handful of scans. Pass a `githubToken` (a fine-grained or classic PAT, `public_repo`/`repo` scope) in the options to raise this to **5,000 requests/hour** and to scan private repositories:
+`scanGitHubRepo` and `scanGitHubUser` call the GitHub REST API directly. A single repo scan issues one tree request plus up to 200 file-content requests (most repos need far fewer). Unauthenticated, GitHub allows **60 requests/hour** — enough for scans of small repos. Pass a `githubToken` (a fine-grained or classic PAT, `public_repo`/`repo` scope) in the options to raise this to **5,000 requests/hour** and to scan private repositories:
 
 ```ts
 await scanGitHubRepo(repo, { signatures, githubToken })
@@ -47,7 +55,7 @@ await scanGitHubRepo(repo, { signatures, githubToken })
 
 ## Risk scoring
 
-Findings are weighted by severity (`critical` 0.4, `high` 0.25, `medium` 0.15, `low` 0.05, `info` 0.01), summed, and capped at 1.0. `getRiskLevel` maps the score to a level using the shared `RISK_THRESHOLDS` (`< 0.3` low, `< 0.6` medium, otherwise high) — with one override: a single `critical` finding always forces `high`, since a lone backdoor or keylogger shouldn't average down to "review before cloning" just because nothing else in the repo was flagged. Pass `findings` as the scanner does (`getRiskLevel(score, findings)`) to get this floor; omit it to fall back to threshold-only scoring. The GitHub **user** scanner uses its own tuned thresholds because profile signals (account age, follower ratios) distribute differently from code findings.
+Findings are weighted by severity (`critical` 0.4, `high` 0.25, `medium` 0.15, `low` 0.05, `info` 0.01), summed, and capped at 1.0. The pre-cap sum is also returned as `rawRiskScore`, so consumers can reconcile per-finding deductions against the capped score (`factors[]` carries each finding's individual weight). `getRiskLevel` maps the score to a level using the shared `RISK_THRESHOLDS` (`< 0.3` low, `< 0.6` medium, otherwise high) — with one override: a single `critical` finding always forces `high`, since a lone backdoor or keylogger shouldn't average down to "review before cloning" just because nothing else in the repo was flagged. Pass `findings` as the scanner does (`getRiskLevel(score, findings)`) to get this floor; omit it to fall back to threshold-only scoring. The GitHub **user** scanner uses its own tuned thresholds because profile signals (account age, follower ratios) distribute differently from code findings.
 
 ## Development
 

@@ -21,7 +21,7 @@ const EMPTY_SIGNATURES: SignatureDatabase = {
 const MOCK_COMMIT_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 /** Build a fetch mock that serves an in-memory file tree as the GitHub API. */
-function mockGitHubApi(files: Record<string, string>) {
+function mockGitHubApi(files: Record<string, string>, sizes: Record<string, number> = {}) {
   return vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input)
 
@@ -36,6 +36,7 @@ function mockGitHubApi(files: Record<string, string>) {
         path,
         type: "blob" as const,
         sha: path,
+        size: sizes[path],
         url: path
       }))
       return new Response(JSON.stringify({ sha: "x", truncated: false, tree }), {
@@ -299,6 +300,84 @@ describe("self-scan guardrail (regex literals are inert data)", () => {
     const src = await scanGitHubRepo(repoInfo, { signatures })
     expect(src.findings.map((f) => f.pattern)).toContain("EXFIL_KEYLOGGER")
     expect(src.riskLevel).toBe("high")
+  })
+})
+
+describe("scan transparency (scanned/skipped tracking)", () => {
+  it("lists exactly which files were scanned and which were skipped, with reasons", async () => {
+    const result = await scan({
+      "src/index.js": `export const a = 1\n`,
+      "README.md": `# readme\n`,
+      "LICENSE": `MIT\n`,
+      "logo.png": ``
+    })
+    expect(result.scanSummary.scannedFiles).toEqual(["src/index.js"])
+    expect(result.scanSummary.filesScanned).toBe(1)
+    expect(result.scanSummary.skippedFiles).toEqual([
+      { path: "README.md", reason: "unsupported-type" },
+      { path: "LICENSE", reason: "unsupported-type" },
+      { path: "logo.png", reason: "unsupported-type" }
+    ])
+    expect(result.scanSummary.skippedCount).toBe(3)
+    expect(result.scanSummary.treeTruncated).toBe(false)
+  })
+
+  it("skips files past the per-scan cap with over-file-limit", async () => {
+    const files: Record<string, string> = {}
+    for (let i = 0; i < 205; i++) files[`src/f${String(i).padStart(3, "0")}.js`] = `export const x = ${i}\n`
+    const result = await scan(files)
+    expect(result.scanSummary.filesScanned).toBe(200)
+    expect(result.scanSummary.scannedFiles).toHaveLength(200)
+    const overLimit = result.scanSummary.skippedFiles.filter((f) => f.reason === "over-file-limit")
+    expect(overLimit).toHaveLength(5)
+    expect(result.scanSummary.skippedCount).toBe(5)
+  })
+
+  it("skips oversized blobs with too-large instead of fetching them", async () => {
+    global.fetch = mockGitHubApi(
+      { "src/small.js": `export const a = 1\n`, "dist/bundle.js": `x` },
+      { "dist/bundle.js": 5 * 1024 * 1024 }
+    ) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+    expect(result.scanSummary.scannedFiles).toEqual(["src/small.js"])
+    expect(result.scanSummary.skippedFiles).toEqual([
+      { path: "dist/bundle.js", reason: "too-large" }
+    ])
+    // The oversized blob's contents were never requested.
+    const urls = (global.fetch as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]))
+    expect(urls.some((u) => u.includes("/contents/dist/bundle.js"))).toBe(false)
+  })
+
+  it("records fetch failures as fetch-failed and does not count them as scanned", async () => {
+    // "src/gone.js" is in the tree but the contents API 404s for it.
+    const api = mockGitHubApi({ "src/ok.js": `export const a = 1\n` })
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/git/trees/")) {
+        const tree = ["src/ok.js", "src/gone.js"].map((path) => ({
+          path,
+          type: "blob" as const,
+          sha: path,
+          url: path
+        }))
+        return new Response(JSON.stringify({ sha: "x", truncated: false, tree }), { status: 200 })
+      }
+      return api(input)
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+    expect(result.scanSummary.scannedFiles).toEqual(["src/ok.js"])
+    expect(result.scanSummary.filesScanned).toBe(1)
+    expect(result.scanSummary.skippedFiles).toEqual([
+      { path: "src/gone.js", reason: "fetch-failed" }
+    ])
+  })
+
+  it("exposes the pre-clamp rawRiskScore so deductions reconcile with the score", async () => {
+    const result = await scan({
+      "src/index.js": `export const a = 1\n`
+    })
+    expect(result.rawRiskScore).toBe(0)
+    expect(result.riskScore).toBe(0)
   })
 })
 

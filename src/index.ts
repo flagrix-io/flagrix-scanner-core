@@ -10,6 +10,8 @@ export type {
   GitHubFinding,
   FindingEvidence,
   GitHubScanResult,
+  SkipReason,
+  SkippedFile,
   GitHubUserFeatures,
   GitHubUserScanResult,
   DocumentMetadata,
@@ -47,5 +49,10 @@ export { scanPdfBytes, scanPdfFromUrl } from "./pdf/pdf-scanner.js"
 export type { PdfScanResult } from "./pdf/pdf-scanner.js"
 
 // Utilities
-export { calculateRiskScore, getSeverityWeight, getRiskLevel } from "./utils/risk-calculator.js"
+export {
+  calculateRawRiskScore,
+  calculateRiskScore,
+  getSeverityWeight,
+  getRiskLevel,
+} from "./utils/risk-calculator.js"
 export { applyYaraRules, isTestFile } from "./rules/rule-matcher.js"

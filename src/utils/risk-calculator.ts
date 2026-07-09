@@ -12,12 +12,20 @@ export function getSeverityWeight(severity: GitHubFinding["severity"]): number {
   return weights[severity]
 }
 
-export function calculateRiskScore(findings: GitHubFinding[]): number {
+/**
+ * Sum of finding weights before the 1.0 clamp. Exposed so consumers can
+ * reconcile per-finding deductions with the clamped score ("capped").
+ */
+export function calculateRawRiskScore(findings: GitHubFinding[]): number {
   let score = 0
   for (const finding of findings) {
     score += getSeverityWeight(finding.severity)
   }
-  return Math.min(1, score)
+  return score
+}
+
+export function calculateRiskScore(findings: GitHubFinding[]): number {
+  return Math.min(1, calculateRawRiskScore(findings))
 }
 
 /**
