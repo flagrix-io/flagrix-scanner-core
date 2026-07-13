@@ -61,6 +61,19 @@ export interface GitHubRepoInfo {
 
 export interface GitHubFinding {
   severity: "critical" | "high" | "medium" | "low" | "info"
+  /**
+   * Confidence that the matched code represents the behavior described by
+   * the finding. Severity describes impact; confidence describes certainty.
+   * Older/custom findings omit this and retain the historical high-confidence
+   * scoring behavior.
+   */
+  confidence?: "high" | "medium" | "low"
+  /**
+   * Whether this finding should contribute to the "safe to clone" verdict.
+   * Runtime/deployment configuration warnings can be important without making
+   * the repository contents unsafe to inspect locally.
+   */
+  cloneBlocking?: boolean
   type:
     | "MALWARE_SIGNATURE"
     | "OBFUSCATED_CODE"
@@ -80,6 +93,7 @@ export interface GitHubFinding {
     | "SUSPICIOUS_FILE_ACCESS"
     | "CODE_INTEGRITY_ISSUE"
     | "SOCIAL_ENGINEERING"
+    | "INSECURE_CONFIGURATION"
   file?: string
   line?: number
   pattern?: string
@@ -220,6 +234,7 @@ export interface DocumentScanResult extends RiskAssessment {
 export interface MaliciousPackage {
   name: string
   version?: string
+  versions?: string[]
   severity: "critical" | "high" | "medium"
   source: string
   description?: string
@@ -232,10 +247,16 @@ export interface YaraRule {
   description: string
   tags: string[]
   severity: "critical" | "high" | "medium" | "low"
+  /** Confidence in the rule after its optional context check succeeds. */
+  confidence?: "high" | "medium" | "low"
+  /** Optional behavioral context required in addition to the primary regex. */
+  context?: "keyboard-capture"
   /** Minimum regex matches in one file before the rule fires (default 1). */
   minMatches?: number
   /** Restrict the rule to files with these extensions (default: all scanned files). */
   fileExtensions?: string[]
+  /** Restrict the rule to exact file basenames (default: all scanned files). */
+  fileNames?: string[]
 }
 
 export interface KnownBadHash {

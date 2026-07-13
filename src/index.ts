@@ -55,4 +55,8 @@ export {
   getSeverityWeight,
   getRiskLevel,
 } from "./utils/risk-calculator.js"
-export { applyYaraRules, isTestFile } from "./rules/rule-matcher.js"
+export {
+  applyYaraRules,
+  isObviousPlaceholderSecret,
+  isTestFile,
+} from "./rules/rule-matcher.js"

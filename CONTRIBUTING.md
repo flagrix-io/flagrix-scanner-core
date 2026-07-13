@@ -20,9 +20,11 @@ repo — add IOCs there, add *detection logic* here.
 
 1. Detectors live in `src/github/repo-scanner.ts`, `src/github/user-scanner.ts`,
    `src/linkedin/profile-scorer.ts`, and `src/pdf/pdf-scanner.ts`.
-2. Return `GitHubFinding`s with an honest `severity` — this drives the risk score
-   (see the Risk scoring section in the README). Reserve `critical` for
-   code-execution / credential-theft patterns.
+2. Return `GitHubFinding`s with an honest `severity` and `confidence`. Severity
+   describes potential impact; confidence describes certainty that the matched
+   code has that behavior. Reserve high-confidence `critical` for verified
+   code-execution / credential-theft chains. Heuristic critical matches do not
+   force the final verdict to high risk.
 3. Add a test. Unit-test the helper directly, or add an end-to-end case to
    `tests/repo-scanner.integration.test.ts`, which drives `scanGitHubRepo` through a
    mocked GitHub API. **Use only benign, non-malicious fixtures** that reproduce the
