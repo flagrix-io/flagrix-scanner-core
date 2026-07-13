@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest"
-import { calculateRiskScore, getRiskLevel, getSeverityWeight } from "../src/utils/risk-calculator"
+import {
+  calculateRawRiskScore,
+  calculateRiskScore,
+  calculateSignalContributions,
+  getRiskLevel,
+  getSeverityWeight,
+} from "../src/utils/risk-calculator"
 import type { GitHubFinding } from "../src/types/index"
 
 function finding(
@@ -73,6 +79,46 @@ describe("calculateRiskScore", () => {
       finding("medium", "low", "OBF_EVAL"),
       minification,
     ])).toBeCloseTo(0.0375)
+  })
+})
+
+describe("calculateSignalContributions", () => {
+  it("weights sum exactly to the raw risk score", () => {
+    const findings = [
+      finding("critical", "medium", "BACKDOOR_RCE"),
+      finding("high", undefined, "EXFIL_COOKIE"),
+      finding("medium", "low", "OBF_EVAL"),
+      finding("medium", "low", "OBF_HEX_STRINGS"),
+      finding("high", undefined, "EXFIL_COOKIE"),
+    ]
+    const contributions = calculateSignalContributions(findings)
+    const total = contributions.reduce((sum, c) => sum + c.weight, 0)
+    expect(total).toBeCloseTo(calculateRawRiskScore(findings), 10)
+  })
+
+  it("collapses repeats into one contribution, keeping the strongest finding", () => {
+    const weak = finding("medium", "low", "OBF_EVAL")
+    const strong = finding("medium", "medium", "OBF_EVAL")
+    const contributions = calculateSignalContributions([weak, strong])
+    expect(contributions).toHaveLength(1)
+    expect(contributions[0]!.weight).toBeCloseTo(0.09) // 0.15 × 0.6
+    expect(contributions[0]!.finding).toBe(strong)
+    expect(contributions[0]!.findingCount).toBe(2)
+  })
+
+  it("applies confidence multipliers to the counted weight", () => {
+    const [c] = calculateSignalContributions([finding("critical", "low", "X")])
+    expect(c!.weight).toBeCloseTo(0.1) // 0.4 × 0.25
+  })
+
+  it("merges the obfuscation heuristic family into one signal", () => {
+    const contributions = calculateSignalContributions([
+      finding("medium", "low", "OBF_BASE64_HEAVY"),
+      finding("medium", "low", "OBF_HEX_STRINGS"),
+    ])
+    expect(contributions).toHaveLength(1)
+    expect(contributions[0]!.signal).toBe("OBFUSCATION_HEURISTIC")
+    expect(contributions[0]!.findingCount).toBe(2)
   })
 })
 

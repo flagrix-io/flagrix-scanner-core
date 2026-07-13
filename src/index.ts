@@ -52,9 +52,11 @@ export type { PdfScanResult } from "./pdf/pdf-scanner.js"
 export {
   calculateRawRiskScore,
   calculateRiskScore,
+  calculateSignalContributions,
   getSeverityWeight,
   getRiskLevel,
 } from "./utils/risk-calculator.js"
+export type { SignalContribution } from "./utils/risk-calculator.js"
 export {
   applyYaraRules,
   isObviousPlaceholderSecret,

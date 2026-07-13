@@ -24,8 +24,8 @@ import { githubApiError } from "./api-error.js"
 import {
   calculateRawRiskScore,
   calculateRiskScore,
+  calculateSignalContributions,
   getRiskLevel,
-  getSeverityWeight,
 } from "../utils/risk-calculator.js"
 import {
   applyYaraRules,
@@ -380,10 +380,15 @@ export async function scanGitHubRepo(
       riskScore,
       rawRiskScore,
       riskLevel,
-      factors: findings.map((f) => ({
-        factor: f.type,
-        weight: getSeverityWeight(f.severity),
-        description: f.description,
+      // One factor per deduped signal, carrying the confidence-adjusted
+      // weight actually counted — factors always sum to rawRiskScore, so
+      // consumers can render a deduction breakdown that reconciles.
+      factors: calculateSignalContributions(findings).map((c) => ({
+        factor: c.finding.type,
+        weight: c.weight,
+        description: c.findingCount > 1
+          ? `${c.finding.description} (strongest of ${c.findingCount} matches counted once)`
+          : c.finding.description,
       })),
       disclaimer: DEFAULT_DISCLAIMER,
       repo,
