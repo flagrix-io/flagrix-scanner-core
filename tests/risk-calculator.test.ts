@@ -2,10 +2,16 @@ import { describe, expect, it } from "vitest"
 import { calculateRiskScore, getRiskLevel, getSeverityWeight } from "../src/utils/risk-calculator"
 import type { GitHubFinding } from "../src/types/index"
 
-function finding(severity: GitHubFinding["severity"]): GitHubFinding {
+function finding(
+  severity: GitHubFinding["severity"],
+  confidence?: GitHubFinding["confidence"],
+  pattern?: string
+): GitHubFinding {
   return {
     severity,
+    confidence,
     type: "MALWARE_SIGNATURE",
+    pattern,
     description: `Test ${severity} finding`,
   }
 }
@@ -26,17 +32,47 @@ describe("calculateRiskScore", () => {
   })
 
   it("sums severity weights correctly", () => {
-    const score = calculateRiskScore([finding("high"), finding("medium")])
+    const score = calculateRiskScore([finding("high", undefined, "A"), finding("medium", undefined, "B")])
     expect(score).toBeCloseTo(0.4) // 0.25 + 0.15
   })
 
   it("caps at 1.0", () => {
-    const manyFindings = Array(10).fill(finding("critical"))
+    const manyFindings = Array.from({ length: 10 }, (_, index) =>
+      finding("critical", undefined, `rule-${index}`)
+    )
     expect(calculateRiskScore(manyFindings)).toBe(1)
   })
 
   it("returns a single critical finding score of 0.4", () => {
     expect(calculateRiskScore([finding("critical")])).toBeCloseTo(0.4)
+  })
+
+  it("discounts medium- and low-confidence heuristic findings", () => {
+    expect(calculateRiskScore([finding("critical", "medium")])).toBeCloseTo(0.24)
+    expect(calculateRiskScore([finding("critical", "low")])).toBeCloseTo(0.1)
+  })
+
+  it("does not multiply one repeated signal across many files", () => {
+    expect(calculateRiskScore([
+      finding("medium", "medium", "OBF_EVAL"),
+      finding("medium", "medium", "OBF_EVAL"),
+      finding("medium", "medium", "OBF_EVAL"),
+    ])).toBeCloseTo(0.09)
+  })
+
+  it("groups related obfuscation heuristics as one signal family", () => {
+    const minification: GitHubFinding = {
+      severity: "medium",
+      confidence: "low",
+      type: "CODE_INTEGRITY_ISSUE",
+      description: "Minified/obfuscated code detected in source repository",
+    }
+    expect(calculateRiskScore([
+      finding("medium", "low", "OBF_BASE64_HEAVY"),
+      finding("medium", "low", "OBF_HEX_STRINGS"),
+      finding("medium", "low", "OBF_EVAL"),
+      minification,
+    ])).toBeCloseTo(0.0375)
   })
 })
 
@@ -65,11 +101,26 @@ describe("getRiskLevel", () => {
     expect(getRiskLevel(0.4, [finding("critical")])).toBe("high")
   })
 
+  it("does not force high for a heuristic critical match", () => {
+    expect(getRiskLevel(0.24, [finding("critical", "medium")])).toBe("low")
+  })
+
   it("ignores the floor when no finding is critical", () => {
     expect(getRiskLevel(0.4, [finding("high"), finding("medium")])).toBe("medium")
   })
 
   it("still applies normal thresholds when findings is omitted", () => {
     expect(getRiskLevel(0.4)).toBe("medium")
+  })
+
+  it("forces high for an independently confirmed malicious dependency", () => {
+    const maliciousDependency: GitHubFinding = {
+      severity: "high",
+      confidence: "high",
+      type: "SUSPICIOUS_DEPENDENCY",
+      package: "known-malware",
+      description: "Known malicious package",
+    }
+    expect(getRiskLevel(0.25, [maliciousDependency])).toBe("high")
   })
 })

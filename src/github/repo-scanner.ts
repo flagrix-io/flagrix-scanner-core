@@ -27,7 +27,13 @@ import {
   getRiskLevel,
   getSeverityWeight,
 } from "../utils/risk-calculator.js"
-import { applyYaraRules, isTestFile } from "../rules/rule-matcher.js"
+import {
+  applyYaraRules,
+  detectKeyboardCapture,
+  isDocumentedAwsExampleKey,
+  isObviousPlaceholderSecret,
+  isTestFile,
+} from "../rules/rule-matcher.js"
 
 // High-risk files to always check
 const PRIORITY_FILES = [
@@ -58,6 +64,8 @@ const SCANNABLE_EXTENSIONS = [
   ".bat",
   ".cmd",
   ".vbs",
+  ".html",
+  ".htm",
 ]
 const MAX_FILES_TO_SCAN = 200
 // Blobs above this are skipped ("too-large"): almost always bundles or
@@ -88,6 +96,26 @@ interface GitHubTreeResponse {
   sha: string
   tree: GitHubTreeItem[]
   truncated: boolean
+}
+
+/**
+ * Preserve inline script text and all newline/character offsets while masking
+ * HTML markup and prose. This lets JS detectors inspect templates without
+ * turning visible page copy or attributes into executable-code findings.
+ */
+function maskExceptInlineScripts(content: string): string {
+  const masked: string[] = [...content].map((char) =>
+    char === "\n" || char === "\r" ? char : " "
+  )
+  const script = /<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi
+  for (const match of content.matchAll(script)) {
+    const body = match[1] ?? ""
+    const bodyOffset = (match.index ?? 0) + match[0].indexOf(body)
+    for (let index = 0; index < body.length; index++) {
+      masked[bodyOffset + index] = body[index]!
+    }
+  }
+  return masked.join("")
 }
 
 export async function scanGitHubRepo(
@@ -197,11 +225,8 @@ export async function scanGitHubRepo(
     )
 
     for (const hidden of hiddenFiles) {
-      if (
-        hidden.path.includes("backdoor") ||
-        hidden.path.includes("payload") ||
-        hidden.path.includes("shell")
-      ) {
+      const basename = hidden.path.split("/").pop() ?? hidden.path
+      if (/^\.(?:backdoor|payload|reverse[-_]?shell)(?:\.|$)/i.test(basename)) {
         findings.push({
           severity: "high",
           type: "HIDDEN_FILE",
@@ -243,8 +268,10 @@ export async function scanGitHubRepo(
       // it would flag every security tool, linter, and tutorial repo
       // (including this scanner's own source). Masking preserves offsets so
       // evidence line numbers stay true; strings/comments stay scannable.
-      const isJsTs = /\.(?:[cm]?js|ts|[jt]sx)$/.test(file.path)
-      let matchable = isJsTs ? maskRegexLiterals(content) : content
+      const isHtml = /\.html?$/i.test(file.path)
+      const isJsTs = /\.(?:[cm]?js|ts|[jt]sx)$/i.test(file.path)
+      const scriptContent = isHtml ? maskExceptInlineScripts(content) : content
+      let matchable = isJsTs || isHtml ? maskRegexLiterals(scriptContent) : scriptContent
       // In test files, string literals are fixtures — the inputs that prove
       // detectors work — so mask those too. Real malware in a test file is
       // actual code (the `npm test` attack) and stays fully scannable.
@@ -274,7 +301,8 @@ export async function scanGitHubRepo(
       }
 
       if (SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext))) {
-        const yaraFindings = applyYaraRules(matchable, yaraRules, file.path)
+        const ruleScopePath = isHtml ? `${file.path}.js` : file.path
+        const yaraFindings = applyYaraRules(matchable, yaraRules, file.path, ruleScopePath)
         findings.push(...yaraFindings)
         patternsMatched += yaraFindings.length
 
@@ -344,6 +372,9 @@ export async function scanGitHubRepo(
     const rawRiskScore = calculateRawRiskScore(findings)
     const riskScore = calculateRiskScore(findings)
     const riskLevel = getRiskLevel(riskScore, findings)
+    const cloneBlockingFindings = findings.filter((finding) => finding.cloneBlocking !== false)
+    const cloneRiskScore = calculateRiskScore(cloneBlockingFindings)
+    const cloneRiskLevel = getRiskLevel(cloneRiskScore, cloneBlockingFindings)
 
     return {
       riskScore,
@@ -367,7 +398,7 @@ export async function scanGitHubRepo(
         treeTruncated: tree.truncated,
       },
       findings,
-      safeToClone: riskLevel === "low",
+      safeToClone: cloneRiskLevel === "low",
       scannedAt: new Date(),
     }
   } catch (error) {
@@ -388,11 +419,12 @@ async function scanPackageJson(
     const pkg = JSON.parse(content)
     const allDeps = { ...pkg.dependencies, ...pkg.devDependencies }
 
-    for (const [name] of Object.entries(allDeps)) {
+    for (const [name, declaredVersion] of Object.entries(allDeps)) {
       const malicious = maliciousPackages.find((m) => m.name === name)
-      if (malicious) {
+      if (malicious && isAffectedPackageVersion(malicious, declaredVersion)) {
         findings.push({
           severity: malicious.severity as GitHubFinding["severity"],
+          confidence: "high",
           type: "SUSPICIOUS_DEPENDENCY",
           file: filePath,
           package: name,
@@ -422,6 +454,25 @@ async function scanPackageJson(
   }
 
   return findings
+}
+
+function isAffectedPackageVersion(
+  malicious: MaliciousPackage,
+  declaredVersion: unknown
+): boolean {
+  const affected = malicious.versions ?? (malicious.version ? [malicious.version] : [])
+  if (affected.length === 0) return true
+  if (typeof declaredVersion !== "string") return false
+
+  let specifier = declaredVersion.trim()
+  if (specifier.startsWith("workspace:")) specifier = specifier.slice("workspace:".length)
+  const npmAlias = specifier.match(/^npm:.+@([^@]+)$/)
+  if (npmAlias) specifier = npmAlias[1]!
+
+  return specifier.split(/\s*\|\|\s*/).some((part) => {
+    const normalized = part.trim().replace(/^[=v~^\s]+/, "")
+    return affected.includes(normalized)
+  })
 }
 
 function checkPostinstallScripts(content: string, filePath: string): GitHubFinding[] {
@@ -483,6 +534,7 @@ function scanPythonDeps(
       if (malicious) {
         findings.push({
           severity: malicious.severity as GitHubFinding["severity"],
+          confidence: "high",
           type: "SUSPICIOUS_DEPENDENCY",
           file: filePath,
           package: name,
@@ -621,13 +673,16 @@ function detectObfuscation(
       )
       .join(", ")
 
-    const severity = linesWithMaliciousCode.length > 0 ? "critical" : "high"
+    // Long lines are common in generated assets and lookup tables. Even when
+    // they contain a risky token, length alone does not establish malware.
+    const severity = "medium" as const
     const firstLine = lines[suspiciousLines[0]!.lineNum - 1]!
     const codeSnippet = extractCodeSnippet(firstLine)
     const codeExplanation = explainSuspiciousCode(firstLine, "OBFUSCATED_CODE")
 
     findings.push({
       severity,
+      confidence: linesWithMaliciousCode.length > 0 ? "medium" : "low",
       type: "OBFUSCATED_CODE",
       file: filePath,
       line: suspiciousLines[0]!.lineNum,
@@ -925,34 +980,64 @@ function detectHardcodedSecrets(
   if (isTestFile(filePath)) return findings
 
   const secretPatterns = [
-    { pattern: /(?:api[_-]?key|apikey)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "API Key", severity: "critical" as const, ruleId: "HARDCODED_API_KEY" },
-    { pattern: /(?:secret[_-]?key|secret)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Secret Key", severity: "critical" as const, ruleId: "HARDCODED_API_KEY" },
-    { pattern: /(?:password|passwd|pwd)\s*[:=]\s*['"]([^'"]{8,})['"]/gi, type: "Password", severity: "critical" as const, ruleId: null },
-    { pattern: /(?:token|auth[_-]?token)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Auth Token", severity: "critical" as const, ruleId: "HARDCODED_API_KEY" },
-    { pattern: /(?:private[_-]?key|privatekey)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Private Key", severity: "critical" as const, ruleId: "HARDCODED_API_KEY" },
+    { pattern: /(?:api[_-]?key|apikey)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "API Key", severity: "high" as const, ruleId: "HARDCODED_API_KEY" },
+    { pattern: /(?:secret[_-]?key|secret)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Secret Key", severity: "high" as const, ruleId: "HARDCODED_API_KEY" },
+    { pattern: /(?:password|passwd|pwd)\s*[:=]\s*['"]([^'"]{8,})['"]/gi, type: "Password", severity: "medium" as const, ruleId: null },
+    { pattern: /(?:token|auth[_-]?token)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Auth Token", severity: "high" as const, ruleId: "HARDCODED_API_KEY" },
+    { pattern: /(?:private[_-]?key|privatekey)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Private Key", severity: "high" as const, ruleId: "HARDCODED_API_KEY" },
     { pattern: /AKIA[0-9A-Z]{16}/g, type: "AWS Access Key", severity: "critical" as const, ruleId: "HARDCODED_AWS_KEY" },
     { pattern: /ghp_[a-zA-Z0-9]{36}/g, type: "GitHub Personal Access Token", severity: "critical" as const, ruleId: "HARDCODED_GITHUB_TOKEN" },
     { pattern: /gho_[a-zA-Z0-9]{36}/g, type: "GitHub OAuth Token", severity: "critical" as const, ruleId: "HARDCODED_GITHUB_TOKEN" },
     { pattern: /sk_live_[a-zA-Z0-9]{24,}/g, type: "Stripe Live Key", severity: "critical" as const, ruleId: "HARDCODED_STRIPE_KEY" },
-    { pattern: /(?:mongodb|mongo)[+:\/\/]{0,6}[^@\s]+:[^@\s]+@/gi, type: "MongoDB Connection String", severity: "high" as const, ruleId: "HARDCODED_DB_CONNECTION" },
-    { pattern: /postgres:\/\/[^@\s]+:[^@\s]+@/gi, type: "PostgreSQL Connection String", severity: "high" as const, ruleId: "HARDCODED_DB_CONNECTION" },
+    { pattern: /(?:mongodb|mongo)[+:\/\/]{0,6}[^@\s]+:[^@\s]+@/gi, type: "MongoDB Connection String", severity: "medium" as const, ruleId: "HARDCODED_DB_CONNECTION" },
+    { pattern: /postgres:\/\/[^@\s]+:[^@\s]+@/gi, type: "PostgreSQL Connection String", severity: "medium" as const, ruleId: "HARDCODED_DB_CONNECTION" },
   ].filter(({ ruleId }) => !ruleId || !coveredRuleIds.has(ruleId))
 
-  const foundSecrets: Array<{ type: string; match: string; severity: "critical" | "high" }> = []
+  const foundSecrets: Array<{ type: string; match: string; severity: "critical" | "high" | "medium" }> = []
   const matchedRegexes: RegExp[] = []
+  const placeholderRegexes: RegExp[] = []
 
   for (const { pattern, type, severity } of secretPatterns) {
     const matches = content.match(pattern)
     if (matches && matches.length > 0) {
-      foundSecrets.push({ type, match: matches[0].substring(0, 50) + "...", severity })
+      const genericSecret = ["API Key", "Secret Key", "Auth Token", "Private Key"].includes(type)
+      const actionableMatches = type === "AWS Access Key"
+        ? matches.filter((match) => !isDocumentedAwsExampleKey(match))
+        : genericSecret
+          ? matches.filter((match) => !isObviousPlaceholderSecret(match))
+          : matches
+      if (actionableMatches.length === 0) {
+        placeholderRegexes.push(pattern)
+        continue
+      }
+      foundSecrets.push({
+        type,
+        match: actionableMatches[0]!.substring(0, 50) + "...",
+        severity,
+      })
       matchedRegexes.push(pattern)
     }
   }
 
+  if (placeholderRegexes.length > 0) {
+    findings.push({
+      severity: "low",
+      confidence: "high",
+      cloneBlocking: false,
+      type: "INSECURE_CONFIGURATION",
+      file: filePath,
+      description: "Predictable placeholder secret must be replaced before deployment",
+      evidence: collectEvidence(content, placeholderRegexes),
+    })
+  }
+
   if (foundSecrets.length > 0) {
-    const highestSeverity = foundSecrets.some((s) => s.severity === "critical") ? "critical" : "high"
+    const highestSeverity = foundSecrets.some((s) => s.severity === "critical")
+      ? "critical"
+      : foundSecrets.some((s) => s.severity === "high") ? "high" : "medium"
     findings.push({
       severity: highestSeverity,
+      confidence: highestSeverity === "critical" ? "high" : "medium",
       type: "HARDCODED_SECRETS",
       file: filePath,
       description: `Hardcoded credentials detected: ${foundSecrets.map((s) => s.type).join(", ")}`,
@@ -979,7 +1064,7 @@ function detectNetworkPatterns(
     // Valid public IPv4 only: each octet bounded 0–255, not embedded in a longer
     // dotted/number sequence (avoids flagging version strings like "1.2.3.4.5" or
     // impossible IPs like "999.999.999.999"), and excluding private/link-local ranges.
-    { pattern: /(?:https?:\/\/)?(?<![\d.])(?!(?:127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.))(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?![\d.])(?::\d{1,5})?/g, type: "Hardcoded IP Address", severity: "high" as const },
+    { pattern: /(?:https?:\/\/)?(?<![\d.])(?!(?:0\.|127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.))(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?![\d.])(?::\d{1,5})?/g, type: "Hardcoded IP Address", severity: "medium" as const, confidence: "low" as const },
     { pattern: /https?:\/\/discord(?:app)?\.com\/api\/webhooks\/\d+\/[a-zA-Z0-9_-]+/gi, type: "Discord Webhook", severity: "critical" as const, ruleId: "NETWORK_DISCORD_WEBHOOK" },
     { pattern: /\d{8,10}:[a-zA-Z0-9_-]{35}/g, type: "Telegram Bot Token", severity: "high" as const, ruleId: "NETWORK_TELEGRAM_TOKEN" },
     { pattern: /(?:pastebin\.com|hastebin\.com|paste\.ee)\/[a-zA-Z0-9]+/gi, type: "Pastebin URL", severity: "medium" as const, ruleId: "NETWORK_PASTEBIN" },
@@ -988,7 +1073,7 @@ function detectNetworkPatterns(
     { pattern: /https?:\/\/[a-zA-Z0-9-]+\.ngrok\.io/gi, type: "Ngrok Tunnel", severity: "medium" as const, ruleId: "NETWORK_NGROK_TUNNEL" },
   ].filter((p) => !("ruleId" in p) || !coveredRuleIds.has((p as { ruleId: string }).ruleId))
 
-  for (const { pattern, type, severity } of suspiciousPatterns) {
+  for (const { pattern, type, severity, confidence } of suspiciousPatterns) {
     const matches = content.match(pattern)
     if (matches && matches.length > 0) {
       const validMatches = matches.filter((m) => {
@@ -1000,6 +1085,7 @@ function detectNetworkPatterns(
       if (validMatches.length > 0) {
         findings.push({
           severity,
+          confidence: confidence ?? "high",
           type: "NETWORK_COMMUNICATION",
           file: filePath,
           description: `Suspicious network communication detected: ${type} (${validMatches.length} occurrence${validMatches.length > 1 ? "s" : ""})`,
@@ -1080,11 +1166,9 @@ function detectDataExfiltration(
 
   const exfiltrationPatterns = [
     { pattern: /navigator\.clipboard\.read(?:Text)?\s*\(/gi, type: "Clipboard Access", severity: "high" as const, ruleId: "EXFIL_CLIPBOARD" },
-    { pattern: /localStorage\.getItem|sessionStorage\.getItem/gi, type: "Storage Access", severity: "medium" as const, ruleId: null },
     { pattern: /document\.cookie/gi, type: "Cookie Access", severity: "high" as const, ruleId: "EXFIL_COOKIE" },
-    { pattern: /(?:addEventListener|on)\s*\(\s*['"](?:keydown|keypress|keyup)['"]/gi, type: "Keylogger Pattern", severity: "critical" as const, ruleId: "EXFIL_KEYLOGGER" },
     { pattern: /(?:input|password|email)[\w-]*\.value/gi, type: "Form Data Access", severity: "medium" as const, ruleId: null },
-    { pattern: /new\s+FormData\s*\([^)]*\)[\s\S]{0,100}(?:fetch|axios|XMLHttpRequest)/gi, type: "Form Data Transmission", severity: "high" as const, ruleId: null },
+    { pattern: /new\s+FormData\s*\([^)]*\)[\s\S]{0,100}(?:fetch|axios|XMLHttpRequest)/gi, type: "Form Data Transmission", severity: "medium" as const, ruleId: null },
   ].filter(({ ruleId }) => !ruleId || !coveredRuleIds.has(ruleId))
 
   const detectedPatterns: string[] = []
@@ -1095,15 +1179,43 @@ function detectDataExfiltration(
     if (pattern.test(content)) {
       detectedPatterns.push(type)
       matchedRegexes.push(pattern)
-      if (severity === "critical" || (severity === "high" && highestSeverity !== "critical")) {
-        highestSeverity = severity
-      }
+      if (severity === "high") highestSeverity = "high"
+    }
+  }
+
+  // Reading a saved theme, locale, or UI preference is not exfiltration.
+  // Require a sensitive-looking storage key and a network sink in the same
+  // local region before reporting browser-storage transmission.
+  const sensitiveStorageRead =
+    /(?:localStorage|sessionStorage)\.getItem\s*\(\s*['"][^'"]*(?:token|secret|password|credential|session|auth|wallet|seed|private)[^'"]*['"]\s*\)/gi
+  for (const match of content.matchAll(sensitiveStorageRead)) {
+    const start = match.index ?? 0
+    const region = content.slice(start, start + 2_000)
+    const networkSink =
+      /(?:fetch\s*\(|axios\.(?:post|put|patch)\s*\(|navigator\.sendBeacon\s*\(|XMLHttpRequest|WebSocket)/gi
+    if (networkSink.test(region)) {
+      detectedPatterns.push("Sensitive Storage Transmission")
+      matchedRegexes.push(sensitiveStorageRead, networkSink)
+      highestSeverity = "high"
+      break
+    }
+  }
+
+  // Built-in fallback for signature sets that predate the context-aware
+  // EXFIL_KEYLOGGER rule. A plain keyboard shortcut/modal handler is benign.
+  if (!coveredRuleIds.has("EXFIL_KEYLOGGER")) {
+    const keyboardCapture = detectKeyboardCapture(content)
+    if (keyboardCapture) {
+      detectedPatterns.push("Keyboard Capture and Transmission")
+      matchedRegexes.push(...keyboardCapture.evidencePatterns)
+      highestSeverity = "critical"
     }
   }
 
   if (detectedPatterns.length > 0) {
     findings.push({
       severity: highestSeverity,
+      confidence: highestSeverity === "medium" ? "low" : "high",
       type: "DATA_EXFILTRATION",
       file: filePath,
       description: `Data exfiltration patterns detected: ${detectedPatterns.join(", ")}`,
@@ -1128,7 +1240,6 @@ function detectBackdoors(
     { pattern: /exec\s*\(\s*(?:request|req)(?:\.|\.body|\.query)/gi, type: "Command Injection Endpoint", severity: "critical" as const, ruleId: "BACKDOOR_RCE_ENDPOINT" },
     { pattern: /require\s*\(\s*(?:request|req)(?:\.|\.body|\.query)/gi, type: "Dynamic Require", severity: "critical" as const, ruleId: "BACKDOOR_DYNAMIC_REQUIRE" },
     { pattern: /new\s+Function\s*\([^)]*(?:request|req)/gi, type: "Dynamic Function from Request", severity: "critical" as const, ruleId: null },
-    { pattern: /(?:admin|debug|backdoor|shell)[\w]*\s*[:=]\s*(?:true|1|"[^"]*")\s*(?:\/\/|#)?\s*(?:TODO|FIXME|HACK)?/gi, type: "Debug/Admin Flag", severity: "high" as const, ruleId: null },
     { pattern: /(?:password|auth)\s*(?:===?|==)\s*['"][^'"]{0,20}['"]\s*\)/gi, type: "Hardcoded Auth Bypass", severity: "critical" as const, ruleId: "BACKDOOR_HARDCODED_AUTH" },
   ].filter(({ ruleId }) => !ruleId || !coveredRuleIds.has(ruleId))
 
@@ -1145,6 +1256,27 @@ function detectBackdoors(
         evidence: collectEvidence(content, pattern),
       })
     }
+  }
+
+  // Flask debug mode is a deployment vulnerability only when the development
+  // debugger is exposed beyond localhost. It is not evidence of a backdoor and
+  // does not make source code unsafe to clone.
+  const exposedFlaskDebugger =
+    /app\.run\s*\((?=[\s\S]{0,400}\bdebug\s*=\s*True)(?=[\s\S]{0,400}\bhost\s*=\s*['"]0\.0\.0\.0['"])[\s\S]{0,400}\)/gi
+  const flaskDebugEnabled = /\bdebug\s*=\s*True/gi
+  const wildcardBind = /\bhost\s*=\s*['"]0\.0\.0\.0['"]/gi
+  if (exposedFlaskDebugger.test(content)) {
+    findings.push({
+      severity: "low",
+      confidence: "high",
+      cloneBlocking: false,
+      type: "INSECURE_CONFIGURATION",
+      file: filePath,
+      description: "Flask debugger is exposed on all network interfaces; disable debug mode before deployment",
+      evidence: collectEvidence(content, [flaskDebugEnabled, wildcardBind]),
+      codeExplanation:
+        "Flask's interactive debugger can execute code and must not be exposed in production. This is a deployment configuration issue, not a repository backdoor.",
+    })
   }
 
   return findings
@@ -1208,8 +1340,7 @@ function detectSuspiciousFileAccess(
     { pattern: /(?:fs\.read|readFileSync|readFile)\s*\([^)]*(?:\.ssh|\.aws|\.gnupg|\.docker|id_rsa|credentials)/gi, type: "SSH/AWS Credentials Access", severity: "critical" as const, ruleId: "FILE_ACCESS_CREDENTIALS" },
     { pattern: /(?:fs\.read|readFileSync|readFile)\s*\([^)]*(?:etc\/passwd|etc\/shadow|\.bash_history|\.zsh_history)/gi, type: "System File Access", severity: "critical" as const, ruleId: "FILE_ACCESS_SYSTEM" },
     { pattern: /(?:fs\.read|readFileSync|readFile)\s*\([^)]*(?:Chrome|Firefox|Safari|Edge)[\w\s/\\]*(?:Cookies|Login|History)/gi, type: "Browser Data Access", severity: "critical" as const, ruleId: "FILE_ACCESS_BROWSER_DATA" },
-    { pattern: /(?:fs\.write|writeFileSync|writeFile)\s*\([^)]*(?:\/etc|\/sys|\/bin|C:\\\\Windows)/gi, type: "System Directory Write", severity: "critical" as const, ruleId: null },
-    { pattern: /(?:fs\.unlink|unlinkSync|rmSync|rm\s+-rf)/gi, type: "File Deletion", severity: "medium" as const, ruleId: null },
+    { pattern: /(?:fs\.write|writeFileSync|writeFile)\s*\([^)]*(?:\/etc|\/sys|\/bin|C:\\\\Windows)/gi, type: "System Directory Write", severity: "medium" as const, ruleId: null },
   ].filter(({ ruleId }) => !ruleId || !coveredRuleIds.has(ruleId))
 
   for (const { pattern, type, severity } of fileAccessPatterns) {
@@ -1217,6 +1348,7 @@ function detectSuspiciousFileAccess(
     if (matches) {
       findings.push({
         severity,
+        confidence: severity === "critical" ? "high" : "medium",
         type: "SUSPICIOUS_FILE_ACCESS",
         file: filePath,
         description: `Suspicious file access detected: ${type}`,
@@ -1225,6 +1357,24 @@ function detectSuspiciousFileAccess(
         evidence: collectEvidence(content, pattern),
       })
     }
+  }
+
+  // Deleting a known temp directory or an application-owned cache is routine
+  // cleanup. Only report destructive deletion when the target is a broad or
+  // sensitive user/system path.
+  const destructiveDeletion =
+    /(?:rm\s+-rf\s+(?:["']?(?:\/|~|\$HOME)(?!\/?(?:tmp|var\/tmp)\b)|[^\n]*[?*])|(?:fs\.)?(?:unlink|unlinkSync|rmSync)\s*\([^\n)]*(?:\.ssh|\.aws|\.gnupg|\.docker|\/etc|\/usr|\/home|Users[\\/]))/gi
+  if (destructiveDeletion.test(content)) {
+    findings.push({
+      severity: "medium",
+      confidence: "medium",
+      type: "SUSPICIOUS_FILE_ACCESS",
+      file: filePath,
+      description: "Suspicious file access detected: Destructive File Deletion",
+      codeExplanation:
+        "📁 Deletes a broad or sensitive user/system path. Verify that the target cannot escape an application-owned directory.",
+      evidence: collectEvidence(content, destructiveDeletion),
+    })
   }
 
   return findings
@@ -1251,6 +1401,7 @@ async function detectCodeIntegrityIssues(
       if (shortVars / totalVars > 0.3) {
         findings.push({
           severity: "medium",
+          confidence: "low",
           type: "CODE_INTEGRITY_ISSUE",
           file: file.path,
           description: "Minified/obfuscated code detected in source repository",
