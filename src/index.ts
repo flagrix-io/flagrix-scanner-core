@@ -38,6 +38,7 @@ export { RISK_THRESHOLDS, DEFAULT_DISCLAIMER } from "./types/index.js"
 
 // GitHub scanners
 export { scanGitHubRepo } from "./github/repo-scanner.js"
+export { detectHistoryTampering } from "./github/history-signals.js"
 export { scanGitHubUser } from "./github/user-scanner.js"
 export { DEFAULT_USER_PROFILE_RULES } from "./github/user-profile-ruleset.js"
 

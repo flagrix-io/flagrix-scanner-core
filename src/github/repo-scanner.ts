@@ -21,6 +21,7 @@ import { DEFAULT_DISCLAIMER } from "../types/index.js"
 import { collectEvidence } from "../utils/evidence.js"
 import { maskRegexLiterals, maskStringLiterals } from "../utils/mask.js"
 import { githubApiError } from "./api-error.js"
+import { fetchHistorySignals } from "./history-signals.js"
 import {
   calculateRawRiskScore,
   calculateRiskScore,
@@ -552,6 +553,14 @@ export async function scanGitHubRepo(
     const integrityFindings = await detectCodeIntegrityIssues(fileContents, allPaths, repo)
     findings.push(...integrityFindings)
     patternsMatched += integrityFindings.length
+
+    // Pushes are timestamped by GitHub, not by the committer — compare them
+    // with commit dates to catch backdated, force-pushed history.
+    const historyFindings = await fetchHistorySignals(
+      `${repo.owner}/${repo.repo}`, branch, commitSha, headers
+    )
+    findings.push(...historyFindings)
+    patternsMatched += historyFindings.length
 
     const rawRiskScore = calculateRawRiskScore(findings)
     const riskScore = calculateRiskScore(findings)

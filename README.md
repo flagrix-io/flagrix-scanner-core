@@ -28,6 +28,8 @@ On top of that cap, it also reads up to **25 editor, agent and CI config files**
 
 Everything else (other docs, images, data files, oversized blobs) is skipped, and the result says so: `scanSummary.scannedFiles` lists every file that was read, and `scanSummary.skippedFiles` lists what was skipped with a per-file reason (`unsupported-type`, `over-file-limit`, `too-large`, `fetch-failed`).
 
+The scan also makes two read-only calls for git-history signals: the branch's push activity and its last 100 commits. A commit pushed 30 or more days after its own date is flagged as `GIT_HISTORY_TAMPERING` / `BACKDATED_PUSH` (medium, or high for a force push). Account-takeover campaigns such as PolinRider backdate loader commits this way. Signed commits, branch creation and pushes onto an empty ref are exempt. A bare force push in the last 90 days is reported as low, non-blocking information. If either call fails, the scan continues without these signals.
+
 ## Usage
 
 ```ts

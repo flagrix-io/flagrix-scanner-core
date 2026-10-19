@@ -94,6 +94,7 @@ export interface GitHubFinding {
     | "CODE_INTEGRITY_ISSUE"
     | "SOCIAL_ENGINEERING"
     | "INSECURE_CONFIGURATION"
+    | "GIT_HISTORY_TAMPERING"
   file?: string
   line?: number
   pattern?: string

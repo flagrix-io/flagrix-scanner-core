@@ -736,3 +736,33 @@ describe("files that configs run with node", () => {
     expect(result.findings.some((f) => f.file === "setup.mjs" && f.pattern === "REMOTE_CODE_FROM_HTTP_RESPONSE")).toBe(true)
   })
 })
+
+describe("git-history signals", () => {
+  it("adds a backdated force push from the activity API to the scan", async () => {
+    const files = { "src/index.js": "export {}\n" }
+    const api = mockGitHubApi(files)
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/activity?ref=refs%2Fheads%2Fmain")) {
+        return new Response(JSON.stringify([{
+          activity_type: "force_push", timestamp: "2026-07-31T10:00:00Z",
+          ref: "refs/heads/main", before: "a".repeat(40), after: MOCK_COMMIT_SHA
+        }]), { status: 200 })
+      }
+      if (url.includes(`/commits?sha=${MOCK_COMMIT_SHA}`)) {
+        return new Response(JSON.stringify([{
+          sha: MOCK_COMMIT_SHA,
+          commit: { committer: { date: "2025-11-06T09:00:00Z" }, verification: { verified: false } }
+        }]), { status: 200 })
+      }
+      return api(input)
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+    expect(result.findings.find((f) => f.type === "GIT_HISTORY_TAMPERING")?.pattern).toBe("BACKDATED_PUSH")
+  })
+
+  it("scans normally when the history endpoints are unavailable", async () => {
+    const result = await scan({ "src/index.js": "export {}\n" })
+    expect(result.findings.filter((f) => f.type === "GIT_HISTORY_TAMPERING")).toEqual([])
+  })
+})
