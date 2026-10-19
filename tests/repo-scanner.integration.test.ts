@@ -766,3 +766,29 @@ describe("git-history signals", () => {
     expect(result.findings.filter((f) => f.type === "GIT_HISTORY_TAMPERING")).toEqual([])
   })
 })
+describe("non-English comments (context only)", () => {
+  it("reports comments in another language as low, non-blocking context", async () => {
+    const russian = [
+      "// Эта функция загружает конфигурацию пользователя из локального хранилища и проверяет её",
+      "// Если конфигурация отсутствует, создаём новую с параметрами по умолчанию для приложения",
+      "// Сохраняем результат обратно, чтобы при следующем запуске не выполнять проверку снова",
+      "// Обработчик ошибок записывает сообщение в журнал и возвращает пустое значение вызывающему",
+    ].join("\n")
+    const result = await scan({ "src/config.js": `${russian}\nexport const load = () => null\n` })
+    const finding = result.findings.find((f) => f.type === "NON_ENGLISH_COMMENTS")
+    expect(finding).toMatchObject({ severity: "low", confidence: "low", cloneBlocking: false })
+    expect(result.safeToClone).toBe(true)
+  })
+
+  it("does not read URLs, lint directives and identifiers in English comments as another language", async () => {
+    const english = [
+      "// eslint-disable-next-line @typescript-eslint/no-unused-vars, vue/one-component-per-file",
+      "// see https://unpkg.com/@vbenjs/static-source@0.1.7/source/logo-v1.webp for the asset",
+      "// prettier-ignore cellRender: { name: 'CellImage' }, v-model:checked, v-model:fileList",
+      "// Create the output directory when it does not exist yet, then write every exported file",
+      "// The cache is invalidated whenever the configuration changes on disk or in settings",
+    ].join("\n")
+    const result = await scan({ "src/a.ts": `${english}\nexport const a = 1\n` })
+    expect(result.findings.filter((f) => f.type === "NON_ENGLISH_COMMENTS")).toEqual([])
+  })
+})

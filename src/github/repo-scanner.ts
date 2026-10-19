@@ -999,6 +999,29 @@ const MIN_NON_ENGLISH_WORDS = 8
 // Only run language detection on comments long enough for franc to be reliable.
 const MIN_COMMENT_LEN_FOR_DETECTION = 40
 
+// Tool directives are not prose (franc reads `eslint-disable …` as French).
+const COMMENT_DIRECTIVE =
+  /^(?:eslint|@ts-|prettier-ignore|istanbul|c8\s|v8\s|jshint|tslint|biome-ignore|global\s|webpackChunkName|[#@]__PURE__|noinspection|type:\s*ignore|noqa|pylint:|fmt:|shellcheck)/i
+// Code inside comments — URLs, inline code, JSDoc tags, paths and dotted or
+// cased identifiers, punctuation — makes franc report French, Dutch or
+// Italian for English and CJK comments alike. Keep only the prose.
+const COMMENT_NON_PROSE = [
+  /https?:\/\/\S+/g,
+  /`[^`\n]*`/g,
+  /@\w+(?:\s*\{[^}\n]{0,80}\})?/g,
+  /(?<![\w$-])[\w$-]+(?:[.:/\\][\w$-]+)+/g,
+  /\b[a-z]+[A-Z][\w$]*/g,
+  /\b[\w$]*_[\w$]*/g,
+  /[{}()[\]<>=;*#|"'+&!?^~\\-]+/g,
+]
+
+function commentProse(comment: string): string | null {
+  if (COMMENT_DIRECTIVE.test(comment)) return null
+  let prose = comment
+  for (const pattern of COMMENT_NON_PROSE) prose = prose.replace(pattern, " ")
+  return prose.replace(/\s+/g, " ").trim()
+}
+
 const COMMENT_PATTERNS: Record<string, RegExp[]> = {
   javascript: [/\/\/(.*)$/gm, /\/\*[\s\S]*?\*\//g],
   typescript: [/\/\/(.*)$/gm, /\/\*[\s\S]*?\*\//g],
@@ -1059,7 +1082,9 @@ function analyzeCommentLanguages(
 ): void {
   let fileNonEnglishWords = 0
 
-  for (const comment of comments) {
+  for (const raw of comments) {
+    const comment = commentProse(raw)
+    if (!comment) continue
     const words = comment.split(/\s+/).filter((word) => word.length >= MIN_WORD_LENGTH)
     fileAnalysis.totalWords += words.length
     fileAnalysis.totalComments += 1
@@ -1129,18 +1154,19 @@ async function detectNonEnglishComments(
         .map(([code, count]) => `${getLanguageName(code)}: ${count} words`)
         .join(", ")
 
-      let severity: "high" | "medium" = "medium"
-      let description = ""
-
-      if (analysis.englishWords === 0) {
-        severity = "high"
-        description = `100% of code comments are in non-English languages (${langBreakdown}). Repository contains NO English comments, which is highly suspicious for projects claiming international scope.`
-      } else {
-        const percentage = Math.round(analysis.nonEnglishPercentage * 100)
-        description = `${percentage}% of code comments are in non-English languages (${langBreakdown}). This may indicate deceptive code where malicious intent is hidden in foreign language comments.`
-      }
-
-      findings.push({ severity, type: "NON_ENGLISH_COMMENTS", description, files: topFiles })
+      // Context, not evidence: comments in another language are normal for
+      // many legitimate projects, and no benchmark sample depends on this
+      // signal. It is shown, but weighs 0.0125 (low × low confidence) and
+      // never blocks cloning.
+      const percentage = Math.round(analysis.nonEnglishPercentage * 100)
+      findings.push({
+        severity: "low",
+        confidence: "low",
+        cloneBlocking: false,
+        type: "NON_ENGLISH_COMMENTS",
+        description: `${percentage}% of code comments appear to be in languages other than English (${langBreakdown}). Normal for many projects; shown for context only.`,
+        files: topFiles,
+      })
     }
   }
 
@@ -1149,10 +1175,10 @@ async function detectNonEnglishComments(
 
 function getLanguageName(code: string): string {
   const names: Record<string, string> = {
-    tur: "Turkish", rus: "Russian", zho: "Chinese", jpn: "Japanese", kor: "Korean",
+    tur: "Turkish", rus: "Russian", zho: "Chinese", cmn: "Chinese", jpn: "Japanese", kor: "Korean",
     ara: "Arabic", deu: "German", fra: "French", spa: "Spanish", por: "Portuguese",
     ita: "Italian", nld: "Dutch", pol: "Polish", ukr: "Ukrainian", vie: "Vietnamese",
-    tha: "Thai", ind: "Indonesian", heb: "Hebrew", hin: "Hindi",
+    tha: "Thai", ind: "Indonesian", heb: "Hebrew", hin: "Hindi", zlm: "Malay", ron: "Romanian",
   }
   return names[code] || code
 }
