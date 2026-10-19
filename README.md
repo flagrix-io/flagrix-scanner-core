@@ -22,7 +22,11 @@ All analysis happens on the caller's device — there is no Flagrix backend and 
 
 ## What gets scanned
 
-A repo scan reads code files (`.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.py`, `.rb`, `.php`, `.go`, `.sh`, `.ps1`, `.psm1`, `.bat`, `.cmd`, `.vbs`) plus dependency manifests (`package.json`, lockfiles, `requirements.txt`, `setup.py`, and similar), capped at **200 files** and **1 MB per file** per scan. Everything else — docs, images, data files, oversized blobs — is skipped, and the result says so: `scanSummary.scannedFiles` lists every file that was read, and `scanSummary.skippedFiles` lists what was skipped with a per-file reason (`unsupported-type`, `over-file-limit`, `too-large`, `fetch-failed`).
+A repo scan reads code files (`.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.py`, `.rb`, `.php`, `.go`, `.sh`, `.ps1`, `.psm1`, `.bat`, `.cmd`, `.vbs`) plus dependency manifests (`package.json`, lockfiles, `requirements.txt`, `setup.py`, and similar), capped at **200 files** and **1 MB per file** per scan.
+
+On top of that cap, it also reads up to **25 editor, agent and CI config files**, which developer tools execute or obey as soon as a repo is opened: `.vscode/{tasks,settings,launch,mcp}.json`, `.claude/settings(.local).json`, MCP configs (`.mcp.json`, `.cursor/mcp.json`, `.amazonq/mcp.json`, …), `.github/workflows/*.yml`, the root `README`, and agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.cursor/rules/*.mdc`, …). These files and `package.json` get the data-driven rules only, scoped by each rule's `fileExtensions` / `fileNames`. It also reads up to **10 font files** (≤ 512 KB each) and flags any that are really JavaScript (`MASQUERADED_SCRIPT_FONT`). Text files are decoded as UTF-8, so rules for invisible Unicode and bidi controls see real code points.
+
+Everything else (other docs, images, data files, oversized blobs) is skipped, and the result says so: `scanSummary.scannedFiles` lists every file that was read, and `scanSummary.skippedFiles` lists what was skipped with a per-file reason (`unsupported-type`, `over-file-limit`, `too-large`, `fetch-failed`).
 
 ## Usage
 
