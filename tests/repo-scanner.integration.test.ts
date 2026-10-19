@@ -7,7 +7,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { scanGitHubRepo } from "../src/github/repo-scanner"
+import { extractCommandTargets, scanGitHubRepo } from "../src/github/repo-scanner"
 import type { SignatureDatabase } from "../src/types/index"
 
 const EMPTY_SIGNATURES: SignatureDatabase = {
@@ -671,5 +671,68 @@ describe("editor / agent config files and masqueraded scripts", () => {
       "fonts/b.ttf": "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 123\n"
     })
     expect(result.findings.filter((f) => f.pattern === "MASQUERADED_SCRIPT_FONT")).toEqual([])
+  })
+})
+
+describe("files that configs run with node", () => {
+  const LOADER_RULE: SignatureDatabase = {
+    ...EMPTY_SIGNATURES,
+    yaraRules: [{
+      id: "REMOTE_CODE_FROM_HTTP_RESPONSE",
+      name: "eval of HTTP response",
+      pattern: String.raw`\beval\s*\(\s*(?:err|res)\.(?:response\.)?data\b`,
+      description: "loader",
+      tags: [],
+      severity: "critical",
+      confidence: "high",
+      fileExtensions: [".js", ".mjs", ".cjs"]
+    }]
+  }
+  const LOADER = "require('axios').get(u).catch(err => { eval(err.response.data) })\n"
+
+  it("resolves node/bun targets relative to the folder a config runs from", () => {
+    expect(extractCommandTargets(
+      `{"tasks":[{"command":"node .vscode/spellright.dict"},{"command":"node","args":["src/assets/card4.jpeg"]}]}`,
+      "app/.vscode/tasks.json"
+    )).toEqual(["app/.vscode/spellright.dict", "app/src/assets/card4.jpeg"])
+    expect(extractCommandTargets(
+      `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node \\"$CLAUDE_PROJECT_DIR\\"/.claude/hooks/start.js"}]}]}}`,
+      ".claude/settings.json"
+    )).toEqual([".claude/hooks/start.js"])
+    expect(extractCommandTargets(`{"scripts":{"preinstall":"node --no-warnings ./setup.mjs"}}`, "packages/a/package.json"))
+      .toEqual(["packages/a/setup.mjs"])
+  })
+
+  it("ignores inline code, absolute paths, URLs and paths outside the repo", () => {
+    expect(extractCommandTargets(
+      `{"a":"node -e \\"process.exit(0)\\"","b":"node /usr/lib/x.js","c":"node ../../x.js","d":"bun https://example.invalid/x.js","engines":{"node":">=18"}}`,
+      "package.json"
+    )).toEqual([])
+  })
+
+  it("scans a non-source file a task runs with node as JavaScript", async () => {
+    global.fetch = mockGitHubApi({
+      ".vscode/tasks.json": `{"tasks":[{"command":"node .vscode/spellright.dict","runOptions":{"runOn":"folderOpen"}}]}`,
+      ".vscode/spellright.dict": LOADER,
+      "src/index.js": "export {}\n"
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: LOADER_RULE })
+    expect(result.scanSummary.scannedFiles).toContain(".vscode/spellright.dict")
+    expect(result.scanSummary.skippedFiles).toEqual([])
+    expect(result.findings.find((f) => f.file === ".vscode/spellright.dict")?.severity).toBe("critical")
+    expect(result.riskLevel).toBe("high")
+  })
+
+  it("reads an install-script target even when the source cap skipped it", async () => {
+    const files: Record<string, string> = {
+      "package.json": `{"name":"x","scripts":{"preinstall":"node setup.mjs"}}`
+    }
+    for (let index = 0; index < 210; index++) files[`src/f${index}.js`] = "export {}\n"
+    files["setup.mjs"] = LOADER
+    global.fetch = mockGitHubApi(files) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: LOADER_RULE })
+    expect(result.scanSummary.scannedFiles).toContain("setup.mjs")
+    expect(result.scanSummary.skippedFiles.map((s) => s.path)).not.toContain("setup.mjs")
+    expect(result.findings.some((f) => f.file === "setup.mjs" && f.pattern === "REMOTE_CODE_FROM_HTTP_RESPONSE")).toBe(true)
   })
 })

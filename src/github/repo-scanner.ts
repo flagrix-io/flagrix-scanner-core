@@ -118,6 +118,62 @@ function isFontFile(path: string): boolean {
 /** Extra budget for config files, on top of MAX_FILES_TO_SCAN. */
 const MAX_CONFIG_FILES = 25
 
+/**
+ * Files a config runs with a JS runtime — `node .vscode/spellright.dict`,
+ * `node src/assets/card4.jpeg`, a hook's `node .claude/hooks/x.js`, an install
+ * script's `node setup.mjs` — are executed as code whatever their extension.
+ * They are read on their own budget (even when the source cap or the
+ * extension filter skipped them) and scanned as JavaScript.
+ */
+const MAX_COMMAND_TARGETS = 10
+const RUNTIME_INVOCATION =
+  /\b(?:node|nodejs|bun|deno\s+run|tsx|ts-node)((?:\s+-{1,2}[\w-]+(?:=[^\s"'`]*)?)*)\s+\\?["']?([^\s"'`&|;<>()]+)/g
+// `node -e <code>` / `-p` take inline code, not a file.
+const INLINE_CODE_FLAG = /(?:^|\s)(?:-[ep]|--eval|--print)(?:\s|=|$)/
+const RUNTIME_ARGS_FORM =
+  /"command"\s*:\s*"(?:node|nodejs|bun|deno|tsx|ts-node)"\s*,\s*"args"\s*:\s*\[\s*"([^"]+)"/g
+// Variables that name the folder a config runs from (VS Code, Claude Code).
+const PROJECT_DIR_VARIABLE =
+  /\\?["']?\$\{?(?:CLAUDE_PROJECT_DIR|workspaceFolder|workspaceRoot)\}?\\?["']?(?=\/)/g
+// Configs inside these dot-dirs run from the folder that holds the dot-dir.
+const DOT_DIR_CONFIG = /^(?:(.*)\/)?\.(?:vscode|claude|cursor|amazonq|gemini|windsurf|roo|kiro|github)\//
+
+/** Repo paths that a config file runs with node/bun/deno/tsx. */
+export function extractCommandTargets(content: string, configPath: string): string[] {
+  const dotDir = configPath.match(DOT_DIR_CONFIG)
+  const base = dotDir
+    ? (dotDir[1] ?? "")
+    : configPath.includes("/") ? configPath.slice(0, configPath.lastIndexOf("/")) : ""
+  const text = content.replace(PROJECT_DIR_VARIABLE, ".")
+  const targets = new Set<string>()
+  for (const match of text.matchAll(RUNTIME_INVOCATION)) {
+    if (INLINE_CODE_FLAG.test(match[1]!)) continue
+    const path = resolveRepoPath(base, match[2]!)
+    if (path) targets.add(path)
+  }
+  for (const match of text.matchAll(RUNTIME_ARGS_FORM)) {
+    const path = resolveRepoPath(base, match[1]!)
+    if (path) targets.add(path)
+  }
+  return [...targets]
+}
+
+function resolveRepoPath(base: string, raw: string): string | null {
+  const target = raw.replace(/\\+$/, "")
+  if (!target || /^[-/~$]/.test(target) || target.includes("://")) return null
+  const segments: string[] = base ? base.split("/") : []
+  for (const segment of target.split("/")) {
+    if (segment === "" || segment === ".") continue
+    if (segment === "..") {
+      if (segments.length === 0) return null
+      segments.pop()
+    } else {
+      segments.push(segment)
+    }
+  }
+  return segments.length > 0 ? segments.join("/") : null
+}
+
 const MAX_FILES_TO_SCAN = 200
 // Blobs above this are skipped ("too-large"): almost always bundles or
 // vendored artifacts, and fetching them dominates scan time on big repos.
@@ -287,6 +343,19 @@ export async function scanGitHubRepo(
       }
     }
     const filesToScan = [...extraFiles, ...sourceBlobs]
+    // Command targets discovered while reading configs join the queue later;
+    // every blob is either queued or skipped, so a target is moved out of
+    // the skipped list when it is queued.
+    const blobsByPath = new Map(
+      tree.tree.filter((item) => item.type === "blob").map((item) => [item.path, item])
+    )
+    const queued = new Set(filesToScan.map((item) => item.path))
+    const commandTargets = new Set<string>()
+    const unskip = (path: string) => {
+      const index = skippedFiles.findIndex((skipped) => skipped.path === path)
+      if (index !== -1) skippedFiles.splice(index, 1)
+      skippedCount--
+    }
 
     // Check for hidden files with suspicious names
     const hiddenFiles = tree.tree.filter(
@@ -341,13 +410,30 @@ export async function scanGitHubRepo(
       const binary = atob(fileData.content || "")
       const content = isFontFile(file.path) ? binary : decodeUtf8(binary)
 
+      if (isConfigFile(file.path) || file.path.endsWith("package.json")) {
+        for (const target of extractCommandTargets(content, file.path)) {
+          if (commandTargets.size >= MAX_COMMAND_TARGETS) break
+          const item = blobsByPath.get(target)
+          if (!item || queued.has(target)) continue
+          if (item.size !== undefined && item.size > MAX_FILE_SIZE_BYTES) continue
+          unskip(target)
+          queued.add(target)
+          commandTargets.add(target)
+          filesToScan.push(item)
+        }
+      }
+
+      const isSource = SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext))
+      // A non-source file that a config runs with node is JavaScript.
+      const runsAsJs = commandTargets.has(file.path) && !isSource && !isFontFile(file.path)
+
       // In JS/TS, blank out regex-literal interiors before pattern matching:
       // a regex *describing* a malicious pattern is inert data, and matching
       // it would flag every security tool, linter, and tutorial repo
       // (including this scanner's own source). Masking preserves offsets so
       // evidence line numbers stay true; strings/comments stay scannable.
       const isHtml = /\.html?$/i.test(file.path)
-      const isJsTs = /\.(?:[cm]?js|ts|[jt]sx)$/i.test(file.path)
+      const isJsTs = runsAsJs || /\.(?:[cm]?js|ts|[jt]sx)$/i.test(file.path)
       const scriptContent = isHtml ? maskExceptInlineScripts(content) : content
       let matchable = isJsTs || isHtml ? maskRegexLiterals(scriptContent) : scriptContent
       // In test files, string literals are fixtures — the inputs that prove
@@ -357,7 +443,7 @@ export async function scanGitHubRepo(
         matchable = maskStringLiterals(matchable)
       }
 
-      if (SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext))) {
+      if (isSource || runsAsJs) {
         fileContents.push({ path: file.path, content: matchable })
       }
 
@@ -381,10 +467,7 @@ export async function scanGitHubRepo(
 
       // Editor/agent/CI configs, docs and package manifests: data-driven
       // rules only (scoped by each rule's fileExtensions / fileNames).
-      if (
-        !SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext)) &&
-        (isConfigFile(file.path) || file.path.endsWith("package.json"))
-      ) {
+      if (!isSource && (isConfigFile(file.path) || file.path.endsWith("package.json"))) {
         const configFindings = applyYaraRules(content, yaraRules, file.path)
         findings.push(...configFindings)
         patternsMatched += configFindings.length
@@ -401,8 +484,8 @@ export async function scanGitHubRepo(
         patternsMatched += pyFindings.length
       }
 
-      if (SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext))) {
-        const ruleScopePath = isHtml ? `${file.path}.js` : file.path
+      if (isSource || runsAsJs) {
+        const ruleScopePath = isHtml || runsAsJs ? `${file.path}.js` : file.path
         const yaraFindings = applyYaraRules(matchable, yaraRules, file.path, ruleScopePath)
         findings.push(...yaraFindings)
         patternsMatched += yaraFindings.length
