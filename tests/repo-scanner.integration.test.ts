@@ -395,14 +395,15 @@ describe("scan transparency (scanned/skipped tracking)", () => {
       "LICENSE": `MIT\n`,
       "logo.png": ``
     })
-    expect(result.scanSummary.scannedFiles).toEqual(["src/index.js"])
-    expect(result.scanSummary.filesScanned).toBe(1)
+    // Root README is an execution-relevant doc (agents and users follow it),
+    // so it is read first; LICENSE and images are still skipped.
+    expect(result.scanSummary.scannedFiles).toEqual(["README.md", "src/index.js"])
+    expect(result.scanSummary.filesScanned).toBe(2)
     expect(result.scanSummary.skippedFiles).toEqual([
-      { path: "README.md", reason: "unsupported-type" },
       { path: "LICENSE", reason: "unsupported-type" },
       { path: "logo.png", reason: "unsupported-type" }
     ])
-    expect(result.scanSummary.skippedCount).toBe(3)
+    expect(result.scanSummary.skippedCount).toBe(2)
     expect(result.scanSummary.treeTruncated).toBe(false)
   })
 
@@ -606,5 +607,69 @@ describe("deployment configuration without malware inflation", () => {
         severity: "critical",
       })
     )
+  })
+})
+
+describe("editor / agent config files and masqueraded scripts", () => {
+  const TASK_RULE: SignatureDatabase = {
+    ...EMPTY_SIGNATURES,
+    yaraRules: [{
+      id: "VSCODE_TASK_AUTORUN",
+      name: "VS Code Task Runs on Folder Open",
+      pattern: String.raw`"runOn"\s*:\s*"folderOpen"`,
+      description: "folderOpen task",
+      tags: [],
+      severity: "medium",
+      confidence: "medium",
+      fileNames: ["tasks.json"]
+    }]
+  }
+
+  it("applies rules to .vscode/tasks.json without displacing source files from the cap", async () => {
+    const files: Record<string, string> = {}
+    for (let index = 0; index < 250; index++) files[`src/f${index}.js`] = "export {}\n"
+    files[".vscode/tasks.json"] = `{"tasks":[{"command":"node x","runOptions":{"runOn":"folderOpen"}}]}`
+    global.fetch = mockGitHubApi(files) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: TASK_RULE })
+    expect(result.scanSummary.scannedFiles[0]).toBe(".vscode/tasks.json")
+    expect(result.scanSummary.filesScanned).toBe(201) // 200 source + 1 config
+    expect(result.findings.some((f) => f.pattern === "VSCODE_TASK_AUTORUN")).toBe(true)
+  })
+
+  it("does not run the JS-oriented built-in detectors on config JSON", async () => {
+    const result = await scan({
+      ".vscode/settings.json": `{"editor.tabSize": 2, "eval": "eval(x)"}`
+    })
+    expect(result.findings).toEqual([])
+  })
+
+  it("flags JavaScript disguised as a font file", async () => {
+    const result = await scan({
+      "public/fonts/fa-solid-500.woff2": `const h = require('https');${" ".repeat(400)}h.get(u, r => eval(r))\n`
+    })
+    const finding = result.findings.find((f) => f.pattern === "MASQUERADED_SCRIPT_FONT")
+    expect(finding?.severity).toBe("critical")
+    expect(result.riskLevel).toBe("high")
+  })
+
+  it("decodes file contents as UTF-8 so non-ASCII rules see real code points", async () => {
+    const BIDI: SignatureDatabase = {
+      ...EMPTY_SIGNATURES,
+      yaraRules: [{
+        id: "TROJAN_SOURCE_BIDI", name: "bidi", pattern: "[\\u202A-\\u202E\\u2066-\\u2069]",
+        description: "bidi", tags: [], severity: "high", confidence: "medium"
+      }]
+    }
+    global.fetch = mockGitHubApi({ "src/a.js": "const ok = 1 /* ‮ } ⁦ */\n" }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: BIDI })
+    expect(result.findings.some((f) => f.pattern === "TROJAN_SOURCE_BIDI")).toBe(true)
+  })
+
+  it("leaves real font data and LFS pointers alone", async () => {
+    const result = await scan({
+      "fonts/a.woff2": "wOF2\u0000\u0001binary-ish-data",
+      "fonts/b.ttf": "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 123\n"
+    })
+    expect(result.findings.filter((f) => f.pattern === "MASQUERADED_SCRIPT_FONT")).toEqual([])
   })
 })

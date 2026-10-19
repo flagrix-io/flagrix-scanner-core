@@ -67,6 +67,57 @@ const SCANNABLE_EXTENSIONS = [
   ".html",
   ".htm",
 ]
+/**
+ * Files that are not "source" but are executed or obeyed by developer tools
+ * the moment a repo is opened: VS Code tasks (runOn: folderOpen), Claude Code
+ * hooks, MCP server configs, CI workflows, and instruction files coding agents
+ * read. 2025–2026 campaigns (Contagious Interview task files, Shai-Hulud /
+ * CHAINDROP hook persistence, poisoned coding tests) live almost entirely
+ * here. They get YARA rules only — the JS-oriented built-in detectors still
+ * run on source files alone — and they are read before source files so the
+ * per-scan file cap can never push them out.
+ */
+const CONFIG_FILE_PATTERNS: RegExp[] = [
+  /(?:^|\/)\.vscode\/(?:tasks|settings|launch|mcp)\.json$/,
+  /(?:^|\/)\.claude\/settings(?:\.local)?\.json$/,
+  /(?:^|\/)\.(?:cursor|amazonq|gemini|windsurf|roo|kiro)\/(?:mcp|settings)\.json$/,
+  /(?:^|\/)\.mcp\.json$/,
+  /^\.github\/workflows\/[^/]+\.ya?ml$/,
+  /^README(?:\.md|\.txt|\.rst)?$/i,
+  /(?:^|\/)(?:AGENTS|CLAUDE|GEMINI)\.md$/,
+  /(?:^|\/)\.(?:cursorrules|windsurfrules|clinerules)$/,
+  /(?:^|\/)\.cursor\/rules\/[^/]+\.mdc?$/,
+  /^\.github\/copilot-instructions\.md$/,
+]
+
+const UTF8 = new TextDecoder("utf-8")
+
+function decodeUtf8(binary: string): string {
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index)
+  return UTF8.decode(bytes)
+}
+
+export function isConfigFile(path: string): boolean {
+  return CONFIG_FILE_PATTERNS.some((pattern) => pattern.test(path))
+}
+
+/**
+ * Font files are binary. A "font" that is really JavaScript text is the
+ * PolinRider / Contagious Interview loader (`node public/fonts/fa-solid-500.woff2`
+ * launched from a folderOpen task). Only a few, small ones are read.
+ */
+const FONT_EXTENSIONS = [".woff", ".woff2", ".ttf", ".otf", ".eot"]
+const MAX_FONT_FILES = 10
+const MAX_FONT_BYTES = 512 * 1024
+
+function isFontFile(path: string): boolean {
+  return FONT_EXTENSIONS.some((ext) => path.toLowerCase().endsWith(ext))
+}
+
+/** Extra budget for config files, on top of MAX_FILES_TO_SCAN. */
+const MAX_CONFIG_FILES = 25
+
 const MAX_FILES_TO_SCAN = 200
 // Blobs above this are skipped ("too-large"): almost always bundles or
 // vendored artifacts, and fetching them dominates scan time on big repos.
@@ -198,9 +249,30 @@ export async function scanGitHubRepo(
       }
     }
 
-    const filesToScan: GitHubTreeItem[] = []
+    // Editor/agent/CI configs and a few small fonts get their own budget on
+    // top of the source cap, so adding them never displaces source coverage
+    // (sharing one cap pushed 5–38 source files out of large repos).
+    const extraFiles: GitHubTreeItem[] = []
+    let configSelected = 0
+    let fontsSelected = 0
+    const sourceBlobs: GitHubTreeItem[] = []
     for (const item of tree.tree) {
       if (item.type !== "blob") continue
+      const config = isConfigFile(item.path)
+      const font = !config && isFontFile(item.path)
+      if (config || font) {
+        const sizeLimit = font ? MAX_FONT_BYTES : MAX_FILE_SIZE_BYTES
+        if (item.size !== undefined && item.size > sizeLimit) {
+          skip(item.path, "too-large")
+        } else if (config ? configSelected >= MAX_CONFIG_FILES : fontsSelected >= MAX_FONT_FILES) {
+          skip(item.path, "over-file-limit")
+        } else {
+          if (config) configSelected++
+          else fontsSelected++
+          extraFiles.push(item)
+        }
+        continue
+      }
       const eligible =
         PRIORITY_FILES.some((pf) => item.path.endsWith(pf)) ||
         SCANNABLE_EXTENSIONS.some((ext) => item.path.endsWith(ext))
@@ -208,12 +280,13 @@ export async function scanGitHubRepo(
         skip(item.path, "unsupported-type")
       } else if (item.size !== undefined && item.size > MAX_FILE_SIZE_BYTES) {
         skip(item.path, "too-large")
-      } else if (filesToScan.length >= MAX_FILES_TO_SCAN) {
+      } else if (sourceBlobs.length >= MAX_FILES_TO_SCAN) {
         skip(item.path, "over-file-limit")
       } else {
-        filesToScan.push(item)
+        sourceBlobs.push(item)
       }
     }
+    const filesToScan = [...extraFiles, ...sourceBlobs]
 
     // Check for hidden files with suspicious names
     const hiddenFiles = tree.tree.filter(
@@ -261,7 +334,12 @@ export async function scanGitHubRepo(
       scannedFiles.push(file.path)
 
       const fileData = await contentResponse.json()
-      const content = atob(fileData.content || "")
+      // atob() yields one Latin-1 char per byte. Decode text as UTF-8 so
+      // non-ASCII detectors (invisible-Unicode payloads, bidi controls,
+      // non-English comments) see real code points instead of mojibake.
+      // Fonts stay byte strings for the magic-number check.
+      const binary = atob(fileData.content || "")
+      const content = isFontFile(file.path) ? binary : decodeUtf8(binary)
 
       // In JS/TS, blank out regex-literal interiors before pattern matching:
       // a regex *describing* a malicious pattern is inert data, and matching
@@ -292,6 +370,29 @@ export async function scanGitHubRepo(
         const postinstallFindings = checkPostinstallScripts(content, file.path)
         findings.push(...postinstallFindings)
         patternsMatched += postinstallFindings.length
+      }
+
+      if (isFontFile(file.path)) {
+        const masquerade = detectMasqueradedScript(content, file.path)
+        findings.push(...masquerade)
+        patternsMatched += masquerade.length
+        continue
+      }
+
+      // Editor/agent/CI configs, docs and package manifests: data-driven
+      // rules only (scoped by each rule's fileExtensions / fileNames).
+      if (
+        !SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext)) &&
+        (isConfigFile(file.path) || file.path.endsWith("package.json"))
+      ) {
+        const configFindings = applyYaraRules(content, yaraRules, file.path)
+        findings.push(...configFindings)
+        patternsMatched += configFindings.length
+        if (/^README/i.test(file.path)) {
+          const socialFindings = detectSocialEngineering(content, file.path)
+          findings.push(...socialFindings)
+          patternsMatched += socialFindings.length
+        }
       }
 
       if (file.path.endsWith("requirements.txt") || file.path.endsWith("setup.py")) {
@@ -550,6 +651,43 @@ function scanPythonDeps(
   }
 
   return findings
+}
+
+// ─── Masqueraded scripts ──────────────────────────────────────────────────────
+
+const FONT_MAGIC = ["wOFF", "wOF2", "\u0000\u0001\u0000\u0000", "OTTO", "true", "ttcf"]
+const SCRIPT_TOKENS =
+  /\b(?:require\s*\(|import\s+[\w{*]|function\s*\w*\s*\(|const\s+\w+\s*=|let\s+\w+\s*=|var\s+\w+\s*=|eval\s*\(|new\s+Function|module\.exports|process\.env|child_process)/
+
+/**
+ * A font file whose bytes are printable text containing JavaScript is not a
+ * font: it is a loader waiting for `node <file>` (task file, hook, script).
+ */
+export function detectMasqueradedScript(content: string, filePath: string): GitHubFinding[] {
+  if (FONT_MAGIC.some((magic) => content.startsWith(magic))) return []
+  // EOT: "LP" magic at byte offset 34.
+  if (filePath.toLowerCase().endsWith(".eot") && content.slice(34, 36) === "LP") return []
+  // Git LFS pointers are text by design.
+  if (content.startsWith("version https://git-lfs.github.com/spec/")) return []
+  const head = content.slice(0, 8192)
+  if (head.length === 0) return []
+  let printable = 0
+  for (let index = 0; index < head.length; index++) {
+    const code = head.charCodeAt(index)
+    if (code === 9 || code === 10 || code === 13 || (code >= 32 && code < 127)) printable++
+  }
+  if (printable / head.length < 0.95 || !SCRIPT_TOKENS.test(content)) return []
+  return [{
+    severity: "critical",
+    confidence: "high",
+    type: "OBFUSCATED_CODE",
+    pattern: "MASQUERADED_SCRIPT_FONT",
+    file: filePath,
+    description: `JavaScript disguised as a font file: ${filePath}`,
+    codeSnippet: content.trimStart().slice(0, 200),
+    codeExplanation:
+      "🎭 This file has a font extension but contains readable JavaScript, not font data. Fake font files are run with `node <file>` from VS Code tasks or hooks to hide a loader from code review.",
+  }]
 }
 
 // ─── Obfuscation detection ────────────────────────────────────────────────────
