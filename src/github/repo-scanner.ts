@@ -993,17 +993,19 @@ function extractCodeSnippet(line: string, maxLength = 500): string {
 
 // ─── Non-English comment detection ───────────────────────────────────────────
 
-const ENGLISH_CODES = ["eng", "sco"]
-const MIN_WORD_LENGTH = 5
-// Thresholds are intentionally conservative: language detection on short code
-// comments is noisy, so we only flag repos with a substantial volume of comments
-// that are clearly (not marginally) non-English, to avoid false-flagging
-// legitimate English or internationally-commented projects.
-const MIN_WORDS_TO_ANALYZE = 30
+// Which Latin-script language a short code comment is in can't be told
+// reliably: franc-min reads plain English ("check if a dev import is already
+// present") as Portuguese, and lint directives as French. Script can be told
+// reliably. A comment counts as non-English when most of its letters are in a
+// non-Latin script (Han, Kana, Hangul, Cyrillic, Arabic, …); franc only names
+// that language. Amounts are measured in letters.
+const LETTER = /\p{L}/gu
+const NON_LATIN_LETTER = /(?!\p{Script=Latin})\p{L}/gu
+const NON_LATIN_SHARE_FOR_COMMENT = 0.5
+// Conservative: only a substantial volume of clearly non-English comment text.
+const MIN_LETTERS_TO_ANALYZE = 150
 const NON_ENGLISH_THRESHOLD = 0.25
-const MIN_NON_ENGLISH_WORDS = 8
-// Only run language detection on comments long enough for franc to be reliable.
-const MIN_COMMENT_LEN_FOR_DETECTION = 40
+const MIN_NON_ENGLISH_LETTERS = 40
 
 // Tool directives are not prose (franc reads `eslint-disable …` as French).
 const COMMENT_DIRECTIVE =
@@ -1039,9 +1041,9 @@ const COMMENT_PATTERNS: Record<string, RegExp[]> = {
 
 interface LanguageAnalysis {
   totalComments: number
-  totalWords: number
-  englishWords: number
-  nonEnglishWords: number
+  totalLetters: number
+  englishLetters: number
+  nonEnglishLetters: number
   nonEnglishPercentage: number
   detectedLanguages: Map<string, number>
   filesWithNonEnglish: Map<string, number>
@@ -1086,37 +1088,30 @@ function analyzeCommentLanguages(
   filePath: string,
   fileAnalysis: LanguageAnalysis
 ): void {
-  let fileNonEnglishWords = 0
+  let fileNonEnglishLetters = 0
 
   for (const raw of comments) {
     const comment = commentProse(raw)
     if (!comment) continue
-    const words = comment.split(/\s+/).filter((word) => word.length >= MIN_WORD_LENGTH)
-    fileAnalysis.totalWords += words.length
+    const letters = comment.match(LETTER)?.length ?? 0
+    if (letters === 0) continue
+    fileAnalysis.totalLetters += letters
     fileAnalysis.totalComments += 1
 
-    if (comment.length >= MIN_COMMENT_LEN_FOR_DETECTION) {
-      const detectedLang = franc(comment)
-
-      if (detectedLang && detectedLang !== "und") {
-        if (ENGLISH_CODES.includes(detectedLang)) {
-          fileAnalysis.englishWords += words.length
-        } else {
-          fileAnalysis.nonEnglishWords += words.length
-          fileNonEnglishWords += words.length
-          const currentCount = fileAnalysis.detectedLanguages.get(detectedLang) || 0
-          fileAnalysis.detectedLanguages.set(detectedLang, currentCount + words.length)
-        }
-      } else {
-        fileAnalysis.englishWords += words.length
-      }
-    } else {
-      fileAnalysis.englishWords += words.length
+    const nonLatin = comment.match(NON_LATIN_LETTER)?.length ?? 0
+    if (nonLatin / letters < NON_LATIN_SHARE_FOR_COMMENT) {
+      fileAnalysis.englishLetters += letters
+      continue
     }
+    const language = franc(comment, { minLength: 3 })
+    const code = language === "und" ? "other" : language
+    fileAnalysis.nonEnglishLetters += letters
+    fileNonEnglishLetters += letters
+    fileAnalysis.detectedLanguages.set(code, (fileAnalysis.detectedLanguages.get(code) ?? 0) + letters)
   }
 
-  if (fileNonEnglishWords > 0) {
-    fileAnalysis.filesWithNonEnglish.set(filePath, fileNonEnglishWords)
+  if (fileNonEnglishLetters > 0) {
+    fileAnalysis.filesWithNonEnglish.set(filePath, fileNonEnglishLetters)
   }
 }
 
@@ -1128,9 +1123,9 @@ async function detectNonEnglishComments(
 
   const analysis: LanguageAnalysis = {
     totalComments: 0,
-    totalWords: 0,
-    englishWords: 0,
-    nonEnglishWords: 0,
+    totalLetters: 0,
+    englishLetters: 0,
+    nonEnglishLetters: 0,
     nonEnglishPercentage: 0,
     detectedLanguages: new Map(),
     filesWithNonEnglish: new Map(),
@@ -1144,12 +1139,12 @@ async function detectNonEnglishComments(
     }
   }
 
-  if (analysis.totalWords >= MIN_WORDS_TO_ANALYZE) {
-    analysis.nonEnglishPercentage = analysis.nonEnglishWords / analysis.totalWords
+  if (analysis.totalLetters >= MIN_LETTERS_TO_ANALYZE) {
+    analysis.nonEnglishPercentage = analysis.nonEnglishLetters / analysis.totalLetters
 
     if (
       analysis.nonEnglishPercentage >= NON_ENGLISH_THRESHOLD &&
-      analysis.nonEnglishWords >= MIN_NON_ENGLISH_WORDS
+      analysis.nonEnglishLetters >= MIN_NON_ENGLISH_LETTERS
     ) {
       const topFiles = Array.from(analysis.filesWithNonEnglish.entries())
         .sort((a, b) => b[1] - a[1])
@@ -1157,7 +1152,8 @@ async function detectNonEnglishComments(
         .map(([path]) => path)
 
       const langBreakdown = Array.from(analysis.detectedLanguages.entries())
-        .map(([code, count]) => `${getLanguageName(code)}: ${count} words`)
+        .sort((a, b) => b[1] - a[1])
+        .map(([code, count]) => `${getLanguageName(code)}: ${count} characters`)
         .join(", ")
 
       // Context, not evidence: comments in another language are normal for
@@ -1170,7 +1166,7 @@ async function detectNonEnglishComments(
         confidence: "low",
         cloneBlocking: false,
         type: "NON_ENGLISH_COMMENTS",
-        description: `${percentage}% of code comments appear to be in languages other than English (${langBreakdown}). Normal for many projects; shown for context only.`,
+        description: `${percentage}% of code comment text is in languages other than English (${langBreakdown}). Normal for many projects; shown for context only.`,
         files: topFiles,
       })
     }
@@ -1184,7 +1180,7 @@ function getLanguageName(code: string): string {
     tur: "Turkish", rus: "Russian", zho: "Chinese", cmn: "Chinese", jpn: "Japanese", kor: "Korean",
     ara: "Arabic", deu: "German", fra: "French", spa: "Spanish", por: "Portuguese",
     ita: "Italian", nld: "Dutch", pol: "Polish", ukr: "Ukrainian", vie: "Vietnamese",
-    tha: "Thai", ind: "Indonesian", heb: "Hebrew", hin: "Hindi", zlm: "Malay", ron: "Romanian",
+    tha: "Thai", ind: "Indonesian", heb: "Hebrew", hin: "Hindi", zlm: "Malay", ron: "Romanian", arb: "Arabic", bel: "Belarusian", other: "Other",
   }
   return names[code] || code
 }
