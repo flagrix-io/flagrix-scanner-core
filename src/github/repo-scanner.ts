@@ -124,9 +124,12 @@ const MAX_CONFIG_FILES = 25
  * `node src/assets/card4.jpeg`, a hook's `node .claude/hooks/x.js`, an install
  * script's `node setup.mjs` — are executed as code whatever their extension.
  * They are read on their own budget (even when the source cap or the
- * extension filter skipped them) and scanned as JavaScript.
+ * extension filter skipped them) and scanned as JavaScript. CI workflows are
+ * left out: their steps run on CI runners, not on the cloner's machine, and
+ * they routinely run test suites that evaluate generated code.
  */
 const MAX_COMMAND_TARGETS = 10
+const CI_WORKFLOW = /^\.github\/workflows\//
 const RUNTIME_INVOCATION =
   /\b(?:node|nodejs|bun|deno\s+run|tsx|ts-node)((?:\s+-{1,2}[\w-]+(?:=[^\s"'`]*)?)*)\s+\\?["']?([^\s"'`&|;<>()]+)/g
 // `node -e <code>` / `-p` take inline code, not a file.
@@ -411,7 +414,10 @@ export async function scanGitHubRepo(
       const binary = atob(fileData.content || "")
       const content = isFontFile(file.path) ? binary : decodeUtf8(binary)
 
-      if (isConfigFile(file.path) || file.path.endsWith("package.json")) {
+      if (
+        (isConfigFile(file.path) && !CI_WORKFLOW.test(file.path)) ||
+        file.path.endsWith("package.json")
+      ) {
         for (const target of extractCommandTargets(content, file.path)) {
           if (commandTargets.size >= MAX_COMMAND_TARGETS) break
           const item = blobsByPath.get(target)

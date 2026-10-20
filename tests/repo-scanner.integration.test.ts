@@ -723,6 +723,15 @@ describe("files that configs run with node", () => {
     expect(result.riskLevel).toBe("high")
   })
 
+  it("does not follow CI workflow steps, which run on CI runners", async () => {
+    global.fetch = mockGitHubApi({
+      ".github/workflows/ci.yml": "jobs:\n  t:\n    steps:\n      - run: node scripts/check.dat\n",
+      "scripts/check.dat": LOADER
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: LOADER_RULE })
+    expect(result.scanSummary.scannedFiles).not.toContain("scripts/check.dat")
+  })
+
   it("reads an install-script target even when the source cap skipped it", async () => {
     const files: Record<string, string> = {
       "package.json": `{"name":"x","scripts":{"preinstall":"node setup.mjs"}}`
