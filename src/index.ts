@@ -23,6 +23,8 @@ export type {
   KnownBadHash,
   SignatureDatabase,
   RepoScanOptions,
+  OsvMaliciousFeed,
+  OsvEcosystemFeed,
   UserScanOptions,
   UserProfileRuleset,
   ProfileRiskRule,
@@ -39,6 +41,7 @@ export { RISK_THRESHOLDS, DEFAULT_DISCLAIMER } from "./types/index.js"
 // GitHub scanners
 export { scanGitHubRepo } from "./github/repo-scanner.js"
 export { detectHistoryTampering } from "./github/history-signals.js"
+export { matchOsvFeed, normalizePypiName } from "./github/osv-feed.js"
 export { scanGitHubUser } from "./github/user-scanner.js"
 export { DEFAULT_USER_PROFILE_RULES } from "./github/user-profile-ruleset.js"
 

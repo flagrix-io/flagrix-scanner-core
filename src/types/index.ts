@@ -338,6 +338,29 @@ export interface UserProfileRuleset {
 export interface RepoScanOptions {
   githubToken?: string
   signatures: SignatureDatabase
+  /**
+   * osv-malicious.json from flagrix-detection-rules: every confirmed-malicious
+   * npm/PyPI package (OSV MAL-* records). Matched locally against declared
+   * dependencies; omit to check only the curated list in `signatures`.
+   */
+  osvFeed?: OsvMaliciousFeed
+}
+
+/** Packages malicious in every version (`all`) or in the listed `versions`. */
+export interface OsvEcosystemFeed {
+  all: string[]
+  versions: Record<string, string[]>
+}
+
+export interface OsvMaliciousFeed {
+  schemaVersion: number
+  source?: string
+  /** Newest record's modified date. */
+  updated?: string
+  counts?: { npm: number; pypi: number }
+  npm: OsvEcosystemFeed
+  /** Names are PEP 503-normalised (lowercase, runs of -_. → -). */
+  pypi: OsvEcosystemFeed
 }
 
 export interface UserScanOptions {

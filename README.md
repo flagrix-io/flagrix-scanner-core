@@ -45,6 +45,15 @@ console.log(result.findings)  // detailed findings with severity + evidence
 console.log(result.commitSha) // the exact commit the verdict applies to
 ```
 
+To check dependencies against every package the OpenSSF malicious-packages project has confirmed malicious (OSV `MAL-*` records: about 220k npm and 12k PyPI names), also pass the `osv-malicious.json` feed that flagrix-detection-rules publishes next to `signatures.json`:
+
+```ts
+const osvFeed = await (await fetch("https://raw.githubusercontent.com/flagrix-io/flagrix-detection-rules/main/osv-malicious.json")).json()
+await scanGitHubRepo(repo, { signatures, osvFeed })
+```
+
+The feed is matched locally: dependency names never leave the device. A hit is a critical `SUSPICIOUS_DEPENDENCY` / `OSV_MALICIOUS_PACKAGE` finding, with high confidence when every version is malicious or the exact affected version is pinned, and medium when a range such as `^1.2.0` merely starts inside an affected range. Packages the repo defines itself and `workspace:`/`file:`/`link:` specifiers are skipped.
+
 Scans are pinned: the branch is resolved to a commit SHA up front and every file is read at that SHA, so a push mid-scan (or between scan and clone) can't invalidate the verdict silently — compare `commitSha` against the head you actually check out.
 
 Also exported: `scanGitHubUser` (profile authenticity scoring) and the shared risk-calculation utilities. See [src/index.ts](src/index.ts) for the full API.

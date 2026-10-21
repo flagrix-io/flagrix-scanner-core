@@ -22,6 +22,7 @@ import { collectEvidence } from "../utils/evidence.js"
 import { maskRegexLiterals, maskStringLiterals } from "../utils/mask.js"
 import { githubApiError } from "./api-error.js"
 import { fetchHistorySignals } from "./history-signals.js"
+import { matchOsvFeed, npmDependencies, pythonDependencies, type DeclaredDependency } from "./osv-feed.js"
 import {
   calculateRawRiskScore,
   calculateRiskScore,
@@ -393,6 +394,10 @@ export async function scanGitHubRepo(
 
     const fileContents: Array<{ path: string; content: string }> = []
     const scannedFiles: string[] = []
+    // Declared dependencies and the package names the repo defines itself,
+    // matched against the OSV feed once every manifest has been read.
+    const declaredDependencies: DeclaredDependency[] = []
+    const localPackageNames = new Set<string>()
 
     for (const file of filesToScan) {
       const contentUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${file.path}?ref=${commitSha}`
@@ -455,6 +460,13 @@ export async function scanGitHubRepo(
       }
 
       if (file.path.endsWith("package.json")) {
+        try {
+          const pkg = JSON.parse(content) as Record<string, unknown>
+          if (typeof pkg.name === "string") localPackageNames.add(pkg.name)
+          declaredDependencies.push(...npmDependencies(pkg, file.path))
+        } catch {
+          // Invalid JSON: nothing to match.
+        }
         const pkgFindings = await scanPackageJson(content, maliciousPackages, file.path)
         findings.push(...pkgFindings)
         patternsMatched += pkgFindings.length
@@ -486,6 +498,7 @@ export async function scanGitHubRepo(
       }
 
       if (file.path.endsWith("requirements.txt") || file.path.endsWith("setup.py")) {
+        declaredDependencies.push(...pythonDependencies(content, file.path))
         const pyFindings = scanPythonDeps(content, maliciousPackages, file.path)
         findings.push(...pyFindings)
         patternsMatched += pyFindings.length
@@ -501,6 +514,17 @@ export async function scanGitHubRepo(
         findings.push(...obfuscationFindings)
         patternsMatched += obfuscationFindings.length
       }
+    }
+
+    if (options.osvFeed) {
+      const alreadyFlagged = new Set(
+        findings
+          .filter((finding) => finding.type === "SUSPICIOUS_DEPENDENCY" && finding.package)
+          .map((finding) => finding.package!)
+      )
+      const osvFindings = matchOsvFeed(options.osvFeed, declaredDependencies, localPackageNames, alreadyFlagged)
+      findings.push(...osvFindings)
+      patternsMatched += osvFindings.length
     }
 
     // Non-English comment detection (source files only, not tests)
