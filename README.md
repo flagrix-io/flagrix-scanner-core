@@ -24,9 +24,11 @@ All analysis happens on the caller's device — there is no Flagrix backend and 
 
 A repo scan reads code files (`.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.py`, `.rb`, `.php`, `.go`, `.sh`, `.ps1`, `.psm1`, `.bat`, `.cmd`, `.vbs`) plus dependency manifests (`package.json`, lockfiles, `requirements.txt`, `setup.py`, and similar), capped at **200 files** and **1 MB per file** per scan.
 
-On top of that cap, it also reads up to **25 editor, agent and CI config files**, which developer tools execute or obey as soon as a repo is opened: `.vscode/{tasks,settings,launch,mcp}.json`, `.claude/settings(.local).json`, MCP configs (`.mcp.json`, `.cursor/mcp.json`, `.amazonq/mcp.json`, …), `.github/workflows/*.yml`, the root `README`, and agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.cursor/rules/*.mdc`, …). These files and `package.json` get the data-driven rules only, scoped by each rule's `fileExtensions` / `fileNames`. It also reads up to **10 font files** (≤ 512 KB each) and flags any that are really JavaScript (`MASQUERADED_SCRIPT_FONT`). Text files are decoded as UTF-8, so rules for invisible Unicode and bidi controls see real code points.
+On top of that cap, it also reads up to **25 editor, agent and CI config files**, which developer tools execute or obey as soon as a repo is opened: `.vscode/{tasks,settings,launch,mcp}.json`, `.claude/settings(.local).json`, MCP configs (`.mcp.json`, `.cursor/mcp.json`, `.amazonq/mcp.json`, …), `.github/workflows/*.yml`, the root `README`, and agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.cursor/rules/*.mdc`, …). These files and `package.json` get the data-driven rules only, scoped by each rule's `fileExtensions` / `fileNames`. It also reads up to **10 font files** (≤ 512 KB each) and flags any that are really JavaScript (`MASQUERADED_SCRIPT_FONT`). Files that those configs (except CI workflows, which run on CI runners rather than your machine) or `package.json` scripts run with `node`/`bun`/`deno`/`tsx` (for example `node .vscode/spellright.dict` or a `preinstall: node setup.mjs`) are read as well, up to **10** per scan and whatever their extension or position in the source cap, and are scanned as JavaScript. Text files are decoded as UTF-8, so rules for invisible Unicode and bidi controls see real code points.
 
 Everything else (other docs, images, data files, oversized blobs) is skipped, and the result says so: `scanSummary.scannedFiles` lists every file that was read, and `scanSummary.skippedFiles` lists what was skipped with a per-file reason (`unsupported-type`, `over-file-limit`, `too-large`, `fetch-failed`).
+
+The scan also makes two read-only calls for git-history signals: the branch's push activity and its last 100 commits. A commit pushed 30 or more days after its own date is flagged as `GIT_HISTORY_TAMPERING` / `BACKDATED_PUSH` (medium, or high for a force push). Account-takeover campaigns such as PolinRider backdate loader commits this way. Signed commits, branch creation and pushes onto an empty ref are exempt. A bare force push in the last 90 days is reported as low, non-blocking information. If either call fails, the scan continues without these signals.
 
 ## Usage
 
@@ -42,6 +44,15 @@ console.log(result.riskLevel) // "low" | "medium" | "high"
 console.log(result.findings)  // detailed findings with severity + evidence
 console.log(result.commitSha) // the exact commit the verdict applies to
 ```
+
+To check dependencies against every package the OpenSSF malicious-packages project has confirmed malicious (OSV `MAL-*` records: about 220k npm and 12k PyPI names), also pass the `osv-malicious.json` feed that flagrix-detection-rules publishes next to `signatures.json`:
+
+```ts
+const osvFeed = await (await fetch("https://raw.githubusercontent.com/flagrix-io/flagrix-detection-rules/main/osv-malicious.json")).json()
+await scanGitHubRepo(repo, { signatures, osvFeed })
+```
+
+The feed is matched locally: dependency names never leave the device. A hit is a critical `SUSPICIOUS_DEPENDENCY` / `OSV_MALICIOUS_PACKAGE` finding, with high confidence when every version is malicious or the exact affected version is pinned, and medium when a range such as `^1.2.0` merely starts inside an affected range. Packages the repo defines itself and `workspace:`/`file:`/`link:` specifiers are skipped.
 
 Scans are pinned: the branch is resolved to a commit SHA up front and every file is read at that SHA, so a push mid-scan (or between scan and clone) can't invalidate the verdict silently — compare `commitSha` against the head you actually check out.
 

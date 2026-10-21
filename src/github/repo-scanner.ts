@@ -21,6 +21,8 @@ import { DEFAULT_DISCLAIMER } from "../types/index.js"
 import { collectEvidence } from "../utils/evidence.js"
 import { maskRegexLiterals, maskStringLiterals } from "../utils/mask.js"
 import { githubApiError } from "./api-error.js"
+import { fetchHistorySignals } from "./history-signals.js"
+import { matchOsvFeed, npmDependencies, pythonDependencies, type DeclaredDependency } from "./osv-feed.js"
 import {
   calculateRawRiskScore,
   calculateRiskScore,
@@ -117,6 +119,65 @@ function isFontFile(path: string): boolean {
 
 /** Extra budget for config files, on top of MAX_FILES_TO_SCAN. */
 const MAX_CONFIG_FILES = 25
+
+/**
+ * Files a config runs with a JS runtime — `node .vscode/spellright.dict`,
+ * `node src/assets/card4.jpeg`, a hook's `node .claude/hooks/x.js`, an install
+ * script's `node setup.mjs` — are executed as code whatever their extension.
+ * They are read on their own budget (even when the source cap or the
+ * extension filter skipped them) and scanned as JavaScript. CI workflows are
+ * left out: their steps run on CI runners, not on the cloner's machine, and
+ * they routinely run test suites that evaluate generated code.
+ */
+const MAX_COMMAND_TARGETS = 10
+const CI_WORKFLOW = /^\.github\/workflows\//
+const RUNTIME_INVOCATION =
+  /\b(?:node|nodejs|bun|deno\s+run|tsx|ts-node)((?:\s+-{1,2}[\w-]+(?:=[^\s"'`]*)?)*)\s+\\?["']?([^\s"'`&|;<>()]+)/g
+// `node -e <code>` / `-p` take inline code, not a file.
+const INLINE_CODE_FLAG = /(?:^|\s)(?:-[ep]|--eval|--print)(?:\s|=|$)/
+const RUNTIME_ARGS_FORM =
+  /"command"\s*:\s*"(?:node|nodejs|bun|deno|tsx|ts-node)"\s*,\s*"args"\s*:\s*\[\s*"([^"]+)"/g
+// Variables that name the folder a config runs from (VS Code, Claude Code).
+const PROJECT_DIR_VARIABLE =
+  /\\?["']?\$\{?(?:CLAUDE_PROJECT_DIR|workspaceFolder|workspaceRoot)\}?\\?["']?(?=\/)/g
+// Configs inside these dot-dirs run from the folder that holds the dot-dir.
+const DOT_DIR_CONFIG = /^(?:(.*)\/)?\.(?:vscode|claude|cursor|amazonq|gemini|windsurf|roo|kiro|github)\//
+
+/** Repo paths that a config file runs with node/bun/deno/tsx. */
+export function extractCommandTargets(content: string, configPath: string): string[] {
+  const dotDir = configPath.match(DOT_DIR_CONFIG)
+  const base = dotDir
+    ? (dotDir[1] ?? "")
+    : configPath.includes("/") ? configPath.slice(0, configPath.lastIndexOf("/")) : ""
+  const text = content.replace(PROJECT_DIR_VARIABLE, ".")
+  const targets = new Set<string>()
+  for (const match of text.matchAll(RUNTIME_INVOCATION)) {
+    if (INLINE_CODE_FLAG.test(match[1]!)) continue
+    const path = resolveRepoPath(base, match[2]!)
+    if (path) targets.add(path)
+  }
+  for (const match of text.matchAll(RUNTIME_ARGS_FORM)) {
+    const path = resolveRepoPath(base, match[1]!)
+    if (path) targets.add(path)
+  }
+  return [...targets]
+}
+
+function resolveRepoPath(base: string, raw: string): string | null {
+  const target = raw.replace(/\\+$/, "")
+  if (!target || /^[-/~$]/.test(target) || target.includes("://")) return null
+  const segments: string[] = base ? base.split("/") : []
+  for (const segment of target.split("/")) {
+    if (segment === "" || segment === ".") continue
+    if (segment === "..") {
+      if (segments.length === 0) return null
+      segments.pop()
+    } else {
+      segments.push(segment)
+    }
+  }
+  return segments.length > 0 ? segments.join("/") : null
+}
 
 const MAX_FILES_TO_SCAN = 200
 // Blobs above this are skipped ("too-large"): almost always bundles or
@@ -287,6 +348,19 @@ export async function scanGitHubRepo(
       }
     }
     const filesToScan = [...extraFiles, ...sourceBlobs]
+    // Command targets discovered while reading configs join the queue later;
+    // every blob is either queued or skipped, so a target is moved out of
+    // the skipped list when it is queued.
+    const blobsByPath = new Map(
+      tree.tree.filter((item) => item.type === "blob").map((item) => [item.path, item])
+    )
+    const queued = new Set(filesToScan.map((item) => item.path))
+    const commandTargets = new Set<string>()
+    const unskip = (path: string) => {
+      const index = skippedFiles.findIndex((skipped) => skipped.path === path)
+      if (index !== -1) skippedFiles.splice(index, 1)
+      skippedCount--
+    }
 
     // Check for hidden files with suspicious names
     const hiddenFiles = tree.tree.filter(
@@ -320,6 +394,10 @@ export async function scanGitHubRepo(
 
     const fileContents: Array<{ path: string; content: string }> = []
     const scannedFiles: string[] = []
+    // Declared dependencies and the package names the repo defines itself,
+    // matched against the OSV feed once every manifest has been read.
+    const declaredDependencies: DeclaredDependency[] = []
+    const localPackageNames = new Set<string>()
 
     for (const file of filesToScan) {
       const contentUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/contents/${file.path}?ref=${commitSha}`
@@ -341,13 +419,33 @@ export async function scanGitHubRepo(
       const binary = atob(fileData.content || "")
       const content = isFontFile(file.path) ? binary : decodeUtf8(binary)
 
+      if (
+        (isConfigFile(file.path) && !CI_WORKFLOW.test(file.path)) ||
+        file.path.endsWith("package.json")
+      ) {
+        for (const target of extractCommandTargets(content, file.path)) {
+          if (commandTargets.size >= MAX_COMMAND_TARGETS) break
+          const item = blobsByPath.get(target)
+          if (!item || queued.has(target)) continue
+          if (item.size !== undefined && item.size > MAX_FILE_SIZE_BYTES) continue
+          unskip(target)
+          queued.add(target)
+          commandTargets.add(target)
+          filesToScan.push(item)
+        }
+      }
+
+      const isSource = SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext))
+      // A non-source file that a config runs with node is JavaScript.
+      const runsAsJs = commandTargets.has(file.path) && !isSource && !isFontFile(file.path)
+
       // In JS/TS, blank out regex-literal interiors before pattern matching:
       // a regex *describing* a malicious pattern is inert data, and matching
       // it would flag every security tool, linter, and tutorial repo
       // (including this scanner's own source). Masking preserves offsets so
       // evidence line numbers stay true; strings/comments stay scannable.
       const isHtml = /\.html?$/i.test(file.path)
-      const isJsTs = /\.(?:[cm]?js|ts|[jt]sx)$/i.test(file.path)
+      const isJsTs = runsAsJs || /\.(?:[cm]?js|ts|[jt]sx)$/i.test(file.path)
       const scriptContent = isHtml ? maskExceptInlineScripts(content) : content
       let matchable = isJsTs || isHtml ? maskRegexLiterals(scriptContent) : scriptContent
       // In test files, string literals are fixtures — the inputs that prove
@@ -357,11 +455,18 @@ export async function scanGitHubRepo(
         matchable = maskStringLiterals(matchable)
       }
 
-      if (SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext))) {
+      if (isSource || runsAsJs) {
         fileContents.push({ path: file.path, content: matchable })
       }
 
       if (file.path.endsWith("package.json")) {
+        try {
+          const pkg = JSON.parse(content) as Record<string, unknown>
+          if (typeof pkg.name === "string") localPackageNames.add(pkg.name)
+          declaredDependencies.push(...npmDependencies(pkg, file.path))
+        } catch {
+          // Invalid JSON: nothing to match.
+        }
         const pkgFindings = await scanPackageJson(content, maliciousPackages, file.path)
         findings.push(...pkgFindings)
         patternsMatched += pkgFindings.length
@@ -381,10 +486,7 @@ export async function scanGitHubRepo(
 
       // Editor/agent/CI configs, docs and package manifests: data-driven
       // rules only (scoped by each rule's fileExtensions / fileNames).
-      if (
-        !SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext)) &&
-        (isConfigFile(file.path) || file.path.endsWith("package.json"))
-      ) {
+      if (!isSource && (isConfigFile(file.path) || file.path.endsWith("package.json"))) {
         const configFindings = applyYaraRules(content, yaraRules, file.path)
         findings.push(...configFindings)
         patternsMatched += configFindings.length
@@ -396,13 +498,14 @@ export async function scanGitHubRepo(
       }
 
       if (file.path.endsWith("requirements.txt") || file.path.endsWith("setup.py")) {
+        declaredDependencies.push(...pythonDependencies(content, file.path))
         const pyFindings = scanPythonDeps(content, maliciousPackages, file.path)
         findings.push(...pyFindings)
         patternsMatched += pyFindings.length
       }
 
-      if (SCANNABLE_EXTENSIONS.some((ext) => file.path.endsWith(ext))) {
-        const ruleScopePath = isHtml ? `${file.path}.js` : file.path
+      if (isSource || runsAsJs) {
+        const ruleScopePath = isHtml || runsAsJs ? `${file.path}.js` : file.path
         const yaraFindings = applyYaraRules(matchable, yaraRules, file.path, ruleScopePath)
         findings.push(...yaraFindings)
         patternsMatched += yaraFindings.length
@@ -411,6 +514,17 @@ export async function scanGitHubRepo(
         findings.push(...obfuscationFindings)
         patternsMatched += obfuscationFindings.length
       }
+    }
+
+    if (options.osvFeed) {
+      const alreadyFlagged = new Set(
+        findings
+          .filter((finding) => finding.type === "SUSPICIOUS_DEPENDENCY" && finding.package)
+          .map((finding) => finding.package!)
+      )
+      const osvFindings = matchOsvFeed(options.osvFeed, declaredDependencies, localPackageNames, alreadyFlagged)
+      findings.push(...osvFindings)
+      patternsMatched += osvFindings.length
     }
 
     // Non-English comment detection (source files only, not tests)
@@ -469,6 +583,14 @@ export async function scanGitHubRepo(
     const integrityFindings = await detectCodeIntegrityIssues(fileContents, allPaths, repo)
     findings.push(...integrityFindings)
     patternsMatched += integrityFindings.length
+
+    // Pushes are timestamped by GitHub, not by the committer — compare them
+    // with commit dates to catch backdated, force-pushed history.
+    const historyFindings = await fetchHistorySignals(
+      `${repo.owner}/${repo.repo}`, branch, commitSha, headers
+    )
+    findings.push(...historyFindings)
+    patternsMatched += historyFindings.length
 
     const rawRiskScore = calculateRawRiskScore(findings)
     const riskScore = calculateRiskScore(findings)
@@ -895,17 +1017,42 @@ function extractCodeSnippet(line: string, maxLength = 500): string {
 
 // ─── Non-English comment detection ───────────────────────────────────────────
 
-const ENGLISH_CODES = ["eng", "sco"]
-const MIN_WORD_LENGTH = 5
-// Thresholds are intentionally conservative: language detection on short code
-// comments is noisy, so we only flag repos with a substantial volume of comments
-// that are clearly (not marginally) non-English, to avoid false-flagging
-// legitimate English or internationally-commented projects.
-const MIN_WORDS_TO_ANALYZE = 30
+// Which Latin-script language a short code comment is in can't be told
+// reliably: franc-min reads plain English ("check if a dev import is already
+// present") as Portuguese, and lint directives as French. Script can be told
+// reliably. A comment counts as non-English when most of its letters are in a
+// non-Latin script (Han, Kana, Hangul, Cyrillic, Arabic, …); franc only names
+// that language. Amounts are measured in letters.
+const LETTER = /\p{L}/gu
+const NON_LATIN_LETTER = /(?!\p{Script=Latin})\p{L}/gu
+const NON_LATIN_SHARE_FOR_COMMENT = 0.5
+// Conservative: only a substantial volume of clearly non-English comment text.
+const MIN_LETTERS_TO_ANALYZE = 150
 const NON_ENGLISH_THRESHOLD = 0.25
-const MIN_NON_ENGLISH_WORDS = 8
-// Only run language detection on comments long enough for franc to be reliable.
-const MIN_COMMENT_LEN_FOR_DETECTION = 40
+const MIN_NON_ENGLISH_LETTERS = 40
+
+// Tool directives are not prose (franc reads `eslint-disable …` as French).
+const COMMENT_DIRECTIVE =
+  /^(?:eslint|@ts-|prettier-ignore|istanbul|c8\s|v8\s|jshint|tslint|biome-ignore|global\s|webpackChunkName|[#@]__PURE__|noinspection|type:\s*ignore|noqa|pylint:|fmt:|shellcheck)/i
+// Code inside comments — URLs, inline code, JSDoc tags, paths and dotted or
+// cased identifiers, punctuation — makes franc report French, Dutch or
+// Italian for English and CJK comments alike. Keep only the prose.
+const COMMENT_NON_PROSE = [
+  /https?:\/\/\S+/g,
+  /`[^`\n]*`/g,
+  /@\w+(?:\s*\{[^}\n]{0,80}\})?/g,
+  /(?<![\w$-])[\w$-]+(?:[.:/\\][\w$-]+)+/g,
+  /\b[a-z]+[A-Z][\w$]*/g,
+  /\b[\w$]*_[\w$]*/g,
+  /[{}()[\]<>=;*#|"'+&!?^~\\-]+/g,
+]
+
+function commentProse(comment: string): string | null {
+  if (COMMENT_DIRECTIVE.test(comment)) return null
+  let prose = comment
+  for (const pattern of COMMENT_NON_PROSE) prose = prose.replace(pattern, " ")
+  return prose.replace(/\s+/g, " ").trim()
+}
 
 const COMMENT_PATTERNS: Record<string, RegExp[]> = {
   javascript: [/\/\/(.*)$/gm, /\/\*[\s\S]*?\*\//g],
@@ -918,9 +1065,9 @@ const COMMENT_PATTERNS: Record<string, RegExp[]> = {
 
 interface LanguageAnalysis {
   totalComments: number
-  totalWords: number
-  englishWords: number
-  nonEnglishWords: number
+  totalLetters: number
+  englishLetters: number
+  nonEnglishLetters: number
   nonEnglishPercentage: number
   detectedLanguages: Map<string, number>
   filesWithNonEnglish: Map<string, number>
@@ -965,35 +1112,30 @@ function analyzeCommentLanguages(
   filePath: string,
   fileAnalysis: LanguageAnalysis
 ): void {
-  let fileNonEnglishWords = 0
+  let fileNonEnglishLetters = 0
 
-  for (const comment of comments) {
-    const words = comment.split(/\s+/).filter((word) => word.length >= MIN_WORD_LENGTH)
-    fileAnalysis.totalWords += words.length
+  for (const raw of comments) {
+    const comment = commentProse(raw)
+    if (!comment) continue
+    const letters = comment.match(LETTER)?.length ?? 0
+    if (letters === 0) continue
+    fileAnalysis.totalLetters += letters
     fileAnalysis.totalComments += 1
 
-    if (comment.length >= MIN_COMMENT_LEN_FOR_DETECTION) {
-      const detectedLang = franc(comment)
-
-      if (detectedLang && detectedLang !== "und") {
-        if (ENGLISH_CODES.includes(detectedLang)) {
-          fileAnalysis.englishWords += words.length
-        } else {
-          fileAnalysis.nonEnglishWords += words.length
-          fileNonEnglishWords += words.length
-          const currentCount = fileAnalysis.detectedLanguages.get(detectedLang) || 0
-          fileAnalysis.detectedLanguages.set(detectedLang, currentCount + words.length)
-        }
-      } else {
-        fileAnalysis.englishWords += words.length
-      }
-    } else {
-      fileAnalysis.englishWords += words.length
+    const nonLatin = comment.match(NON_LATIN_LETTER)?.length ?? 0
+    if (nonLatin / letters < NON_LATIN_SHARE_FOR_COMMENT) {
+      fileAnalysis.englishLetters += letters
+      continue
     }
+    const language = franc(comment, { minLength: 3 })
+    const code = language === "und" ? "other" : language
+    fileAnalysis.nonEnglishLetters += letters
+    fileNonEnglishLetters += letters
+    fileAnalysis.detectedLanguages.set(code, (fileAnalysis.detectedLanguages.get(code) ?? 0) + letters)
   }
 
-  if (fileNonEnglishWords > 0) {
-    fileAnalysis.filesWithNonEnglish.set(filePath, fileNonEnglishWords)
+  if (fileNonEnglishLetters > 0) {
+    fileAnalysis.filesWithNonEnglish.set(filePath, fileNonEnglishLetters)
   }
 }
 
@@ -1005,9 +1147,9 @@ async function detectNonEnglishComments(
 
   const analysis: LanguageAnalysis = {
     totalComments: 0,
-    totalWords: 0,
-    englishWords: 0,
-    nonEnglishWords: 0,
+    totalLetters: 0,
+    englishLetters: 0,
+    nonEnglishLetters: 0,
     nonEnglishPercentage: 0,
     detectedLanguages: new Map(),
     filesWithNonEnglish: new Map(),
@@ -1021,12 +1163,12 @@ async function detectNonEnglishComments(
     }
   }
 
-  if (analysis.totalWords >= MIN_WORDS_TO_ANALYZE) {
-    analysis.nonEnglishPercentage = analysis.nonEnglishWords / analysis.totalWords
+  if (analysis.totalLetters >= MIN_LETTERS_TO_ANALYZE) {
+    analysis.nonEnglishPercentage = analysis.nonEnglishLetters / analysis.totalLetters
 
     if (
       analysis.nonEnglishPercentage >= NON_ENGLISH_THRESHOLD &&
-      analysis.nonEnglishWords >= MIN_NON_ENGLISH_WORDS
+      analysis.nonEnglishLetters >= MIN_NON_ENGLISH_LETTERS
     ) {
       const topFiles = Array.from(analysis.filesWithNonEnglish.entries())
         .sort((a, b) => b[1] - a[1])
@@ -1034,21 +1176,23 @@ async function detectNonEnglishComments(
         .map(([path]) => path)
 
       const langBreakdown = Array.from(analysis.detectedLanguages.entries())
-        .map(([code, count]) => `${getLanguageName(code)}: ${count} words`)
+        .sort((a, b) => b[1] - a[1])
+        .map(([code, count]) => `${getLanguageName(code)}: ${count} characters`)
         .join(", ")
 
-      let severity: "high" | "medium" = "medium"
-      let description = ""
-
-      if (analysis.englishWords === 0) {
-        severity = "high"
-        description = `100% of code comments are in non-English languages (${langBreakdown}). Repository contains NO English comments, which is highly suspicious for projects claiming international scope.`
-      } else {
-        const percentage = Math.round(analysis.nonEnglishPercentage * 100)
-        description = `${percentage}% of code comments are in non-English languages (${langBreakdown}). This may indicate deceptive code where malicious intent is hidden in foreign language comments.`
-      }
-
-      findings.push({ severity, type: "NON_ENGLISH_COMMENTS", description, files: topFiles })
+      // Context, not evidence: comments in another language are normal for
+      // many legitimate projects, and no benchmark sample depends on this
+      // signal. It is shown, but weighs 0.0125 (low × low confidence) and
+      // never blocks cloning.
+      const percentage = Math.round(analysis.nonEnglishPercentage * 100)
+      findings.push({
+        severity: "low",
+        confidence: "low",
+        cloneBlocking: false,
+        type: "NON_ENGLISH_COMMENTS",
+        description: `${percentage}% of code comment text is in languages other than English (${langBreakdown}). Normal for many projects; shown for context only.`,
+        files: topFiles,
+      })
     }
   }
 
@@ -1057,10 +1201,10 @@ async function detectNonEnglishComments(
 
 function getLanguageName(code: string): string {
   const names: Record<string, string> = {
-    tur: "Turkish", rus: "Russian", zho: "Chinese", jpn: "Japanese", kor: "Korean",
+    tur: "Turkish", rus: "Russian", zho: "Chinese", cmn: "Chinese", jpn: "Japanese", kor: "Korean",
     ara: "Arabic", deu: "German", fra: "French", spa: "Spanish", por: "Portuguese",
     ita: "Italian", nld: "Dutch", pol: "Polish", ukr: "Ukrainian", vie: "Vietnamese",
-    tha: "Thai", ind: "Indonesian", heb: "Hebrew", hin: "Hindi",
+    tha: "Thai", ind: "Indonesian", heb: "Hebrew", hin: "Hindi", zlm: "Malay", ron: "Romanian", arb: "Arabic", bel: "Belarusian", other: "Other",
   }
   return names[code] || code
 }

