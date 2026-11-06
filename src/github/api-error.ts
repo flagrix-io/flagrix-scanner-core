@@ -1,4 +1,20 @@
 /**
+ * Whether a failed response is GitHub refusing because the request budget is
+ * spent — the primary hourly limit (`x-ratelimit-remaining: 0`) or a secondary
+ * limit, which answers 403/429 with `retry-after` instead.
+ *
+ * Headers only: the caller may still want to read the body, and mid-scan this
+ * is asked once per file, where parsing JSON for every miss would be waste.
+ */
+export function isRateLimitResponse(response: Response): boolean {
+  if (response.status !== 403 && response.status !== 429) return false
+  return (
+    response.headers?.get("x-ratelimit-remaining") === "0" ||
+    response.headers?.get("retry-after") !== null
+  )
+}
+
+/**
  * Turns a failed GitHub API response into an actionable error.
  *
  * GitHub uses 403 for several unrelated conditions (SAML/SSO enforcement,
