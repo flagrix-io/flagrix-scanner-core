@@ -26,7 +26,7 @@ A repo scan reads code files (`.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.py
 
 On top of that cap, it also reads up to **25 editor, agent and CI config files**, which developer tools execute or obey as soon as a repo is opened: `.vscode/{tasks,settings,launch,mcp}.json`, `.claude/settings(.local).json`, MCP configs (`.mcp.json`, `.cursor/mcp.json`, `.amazonq/mcp.json`, …), `.github/workflows/*.yml`, the root `README`, and agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.cursor/rules/*.mdc`, …). These files and `package.json` get the data-driven rules only, scoped by each rule's `fileExtensions` / `fileNames`. It also reads up to **10 font files** (≤ 512 KB each) and flags any that are really JavaScript (`MASQUERADED_SCRIPT_FONT`). Files that those configs (except CI workflows, which run on CI runners rather than your machine) or `package.json` scripts run with `node`/`bun`/`deno`/`tsx` (for example `node .vscode/spellright.dict` or a `preinstall: node setup.mjs`) are read as well, up to **10** per scan and whatever their extension or position in the source cap, and are scanned as JavaScript. Text files are decoded as UTF-8, so rules for invisible Unicode and bidi controls see real code points.
 
-Everything else (other docs, images, data files, oversized blobs) is skipped, and the result says so: `scanSummary.scannedFiles` lists every file that was read, and `scanSummary.skippedFiles` lists what was skipped with a per-file reason (`unsupported-type`, `over-file-limit`, `too-large`, `fetch-failed`).
+Everything else (other docs, images, data files, oversized blobs) is skipped, and the result says so: `scanSummary.scannedFiles` lists every file that was read, and `scanSummary.skippedFiles` lists what was skipped with a per-file reason (`unsupported-type`, `over-file-limit`, `too-large`, `fetch-failed`, `rate-limited`).
 
 The scan also makes two read-only calls for git-history signals: the branch's push activity and its last 100 commits. A commit pushed 30 or more days after its own date is flagged as `GIT_HISTORY_TAMPERING` / `BACKDATED_PUSH` (medium, or high for a force push). Account-takeover campaigns such as PolinRider backdate loader commits this way. Signed commits, branch creation and pushes onto an empty ref are exempt. A bare force push in the last 90 days is reported as low, non-blocking information. If either call fails, the scan continues without these signals.
 
@@ -67,6 +67,44 @@ The package also ships standalone `scoreLinkedInProfile` and `scanPdfBytes` / `s
 ```ts
 await scanGitHubRepo(repo, { signatures, githubToken })
 ```
+
+A scan that runs out of budget part-way through does **not** quietly return a
+clean verdict. The first refusal (`x-ratelimit-remaining: 0`, or a secondary
+limit's `retry-after`) stops the read — there is no point spending the next 150
+requests on certain refusals — and every file that went unread is recorded as
+`rate-limited`. The result then carries `scanSummary.complete: false` and
+`scanSummary.incompleteReason: "rate-limit"`.
+
+**Consumers must qualify the verdict when `complete` is false.** Files that were
+never read cannot clear a repository, so "no findings" over partial coverage is
+not a clean bill of health:
+
+```ts
+const result = await scanGitHubRepo(repo, { signatures })
+if (!result.scanSummary.complete) {
+  // Coverage fell short — say so instead of showing "safe to clone".
+  console.warn(
+    `Partial scan (${result.scanSummary.incompleteReason}): read ` +
+      `${result.scanSummary.filesScanned} of ` +
+      `${result.scanSummary.filesScanned + result.scanSummary.skippedCount} files.`
+  )
+}
+```
+
+`incompleteReason` is `"fetch-errors"` when individual reads failed for some
+other reason; those do not stop the scan, since one bad response says nothing
+about the next file.
+
+## What a 404 means
+
+GitHub answers `404` rather than `403` for a repository the caller may not see, so "not found" really means "not visible to you". `githubNotFoundError(hasToken)` splits the two cases, because they have different fixes:
+
+| `githubToken` | Message |
+|---|---|
+| absent | The repo is private; add a token. |
+| present | The token expired, or it's a fine-grained token whose repository access doesn't cover this repo. |
+
+Reporting both as "add a token" sends someone who already has one nowhere.
 
 ## Risk scoring
 

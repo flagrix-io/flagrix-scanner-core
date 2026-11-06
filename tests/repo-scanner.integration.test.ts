@@ -801,3 +801,138 @@ describe("non-English comments (context only)", () => {
     expect(result.findings.filter((f) => f.type === "NON_ENGLISH_COMMENTS")).toEqual([])
   })
 })
+
+describe("scanGitHubRepo coverage honesty", () => {
+  /**
+   * Serves `allowed` content reads, then answers every further one the way
+   * GitHub answers a spent request budget.
+   */
+  function mockSpentBudgetApi(
+    files: Record<string, string>,
+    allowed: number,
+    kind: "primary" | "secondary" | "other" = "primary"
+  ) {
+    let contentReads = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (/\/commits\/[^/]+$/.test(url)) {
+        return new Response(JSON.stringify({ sha: MOCK_COMMIT_SHA }), { status: 200 })
+      }
+      if (url.includes("/git/trees/")) {
+        const tree = Object.keys(files).map((path) => ({
+          path,
+          type: "blob" as const,
+          sha: path,
+          url: path
+        }))
+        return new Response(JSON.stringify({ sha: "x", truncated: false, tree }), {
+          status: 200
+        })
+      }
+      const contentMatch = url.match(/\/contents\/(.+?)\?ref=/)
+      if (contentMatch) {
+        contentReads++
+        if (contentReads > allowed) {
+          if (kind === "other") return new Response("{}", { status: 500 })
+          const headers =
+            kind === "primary" ? { "x-ratelimit-remaining": "0" } : { "retry-after": "60" }
+          return new Response(JSON.stringify({ message: "API rate limit exceeded" }), {
+            status: 403,
+            headers
+          })
+        }
+        const path = decodeURIComponent(contentMatch[1]!)
+        const b64 = Buffer.from(files[path] ?? "", "utf-8").toString("base64")
+        return new Response(JSON.stringify({ content: b64 }), { status: 200 })
+      }
+      return new Response("{}", { status: 404 })
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+    return { contentReads: () => contentReads }
+  }
+
+  const tenCleanFiles = Object.fromEntries(
+    Array.from({ length: 10 }, (_, i) => [`src/mod${i}.js`, `export const n${i} = ${i}\n`])
+  )
+
+  it("reports a complete scan when every selected file was read", async () => {
+    const result = await scan(tenCleanFiles)
+    expect(result.scanSummary.complete).toBe(true)
+    expect(result.scanSummary.incompleteReason).toBeUndefined()
+    expect(result.scanSummary.filesScanned).toBe(10)
+  })
+
+  it("marks the scan incomplete once the request budget is spent", async () => {
+    mockSpentBudgetApi(tenCleanFiles, 3)
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+
+    expect(result.scanSummary.complete).toBe(false)
+    expect(result.scanSummary.incompleteReason).toBe("rate-limit")
+    // The verdict still comes back — it just must not claim full coverage.
+    expect(result.scanSummary.filesScanned).toBe(3)
+    const rateLimited = result.scanSummary.skippedFiles.filter(
+      (file) => file.reason === "rate-limited"
+    )
+    expect(rateLimited).toHaveLength(7)
+  })
+
+  it("stops asking GitHub once the budget is spent", async () => {
+    const api = mockSpentBudgetApi(tenCleanFiles, 3)
+    await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+    // 3 served + 1 refusal; the remaining 6 are never requested.
+    expect(api.contentReads()).toBe(4)
+  })
+
+  it("treats a secondary rate limit the same as the hourly one", async () => {
+    mockSpentBudgetApi(tenCleanFiles, 1, "secondary")
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+    expect(result.scanSummary.incompleteReason).toBe("rate-limit")
+    expect(result.scanSummary.skippedFiles.every((f) => f.reason === "rate-limited")).toBe(true)
+  })
+
+  it("separates ordinary read failures from a spent budget, and keeps reading", async () => {
+    const api = mockSpentBudgetApi(tenCleanFiles, 3, "other")
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+
+    expect(result.scanSummary.complete).toBe(false)
+    expect(result.scanSummary.incompleteReason).toBe("fetch-errors")
+    expect(
+      result.scanSummary.skippedFiles.filter((file) => file.reason === "fetch-failed")
+    ).toHaveLength(7)
+    // A one-off 500 says nothing about the next file, so all 10 are attempted.
+    expect(api.contentReads()).toBe(10)
+  })
+})
+
+describe("scanGitHubRepo 404 diagnosis", () => {
+  /** Everything the scan asks for answers 404, the way GitHub hides a repo. */
+  function mockInvisibleRepo() {
+    const seen: string[] = []
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(String((init?.headers as Record<string, string>)?.Authorization ?? ""))
+      return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 })
+    }) as unknown as typeof fetch
+    return { authHeaders: () => seen }
+  }
+
+  it("reads a 404 without a token as a private repository", async () => {
+    mockInvisibleRepo()
+    await expect(
+      scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+    ).rejects.toThrow(/private repository/i)
+  })
+
+  it("blames the token when one was sent", async () => {
+    // GitHub answers 404 for a repo the caller may not see, so a token that
+    // expired or never covered this repo looks identical to a private one.
+    // Telling someone who has a token to add a token is the dead end.
+    const api = mockInvisibleRepo()
+    await expect(
+      scanGitHubRepo(repoInfo, {
+        signatures: EMPTY_SIGNATURES,
+        githubToken: "ghp_expired"
+      })
+    ).rejects.toThrow(/token can't see this repository/i)
+    expect(api.authHeaders()[0]).toBe("Bearer ghp_expired")
+  })
+})

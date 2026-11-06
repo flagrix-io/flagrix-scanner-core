@@ -120,6 +120,7 @@ export type SkipReason =
   | "over-file-limit" // eligible, but past the per-scan file cap
   | "too-large" // eligible, but blob exceeds the size limit
   | "fetch-failed" // selected, but the contents API request failed
+  | "rate-limited" // selected, but the GitHub request budget ran out first
 
 export interface SkippedFile {
   path: string
@@ -156,6 +157,16 @@ export interface GitHubScanResult extends RiskAssessment {
     skippedCount: number
     /** GitHub returned a partial tree (repo too large for one tree call). */
     treeTruncated: boolean
+    /**
+     * Whether every file the scan selected was actually read. False means the
+     * verdict rests on partial evidence — unread files cannot clear a repo, so
+     * a "no findings" result is only as strong as its coverage. Consumers must
+     * qualify the verdict when this is false rather than presenting it as a
+     * clean bill of health.
+     */
+    complete: boolean
+    /** Why coverage fell short, when `complete` is false. */
+    incompleteReason?: "rate-limit" | "fetch-errors"
   }
   findings: GitHubFinding[]
   safeToClone: boolean
