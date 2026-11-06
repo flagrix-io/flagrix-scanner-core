@@ -20,7 +20,11 @@ import type {
 import { DEFAULT_DISCLAIMER } from "../types/index.js"
 import { collectEvidence } from "../utils/evidence.js"
 import { maskRegexLiterals, maskStringLiterals } from "../utils/mask.js"
-import { githubApiError, isRateLimitResponse } from "./api-error.js"
+import {
+  githubApiError,
+  githubNotFoundError,
+  isRateLimitResponse
+} from "./api-error.js"
 import { fetchHistorySignals } from "./history-signals.js"
 import { matchOsvFeed, npmDependencies, pythonDependencies, type DeclaredDependency } from "./osv-feed.js"
 import {
@@ -255,10 +259,8 @@ export async function scanGitHubRepo(
         `https://api.github.com/repos/${repo.owner}/${repo.repo}`,
         { headers }
       )
-      if (repoResponse.status === 404 && !options.githubToken) {
-        throw new Error(
-          "This appears to be a private repository. To scan private repos, add a GitHub personal access token in Flagrix settings."
-        )
+      if (repoResponse.status === 404) {
+        throw githubNotFoundError(Boolean(options.githubToken))
       }
       if (!repoResponse.ok) {
         throw await githubApiError(repoResponse)
@@ -275,10 +277,8 @@ export async function scanGitHubRepo(
       `https://api.github.com/repos/${repo.owner}/${repo.repo}/commits/${encodeURIComponent(branch)}`,
       { headers }
     )
-    if (commitResponse.status === 404 && !options.githubToken) {
-      throw new Error(
-        "This appears to be a private repository. To scan private repos, add a GitHub personal access token in Flagrix settings."
-      )
+    if (commitResponse.status === 404) {
+      throw githubNotFoundError(Boolean(options.githubToken))
     }
     if (!commitResponse.ok) {
       throw await githubApiError(commitResponse)
@@ -288,10 +288,8 @@ export async function scanGitHubRepo(
     const treeUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/git/trees/${commitSha}?recursive=1`
     const treeResponse = await fetch(treeUrl, { headers })
 
-    if (treeResponse.status === 404 && !options.githubToken) {
-      throw new Error(
-        "This appears to be a private repository. To scan private repos, add a GitHub personal access token in Flagrix settings."
-      )
+    if (treeResponse.status === 404) {
+      throw githubNotFoundError(Boolean(options.githubToken))
     }
     if (!treeResponse.ok) {
       throw await githubApiError(treeResponse)

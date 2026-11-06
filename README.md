@@ -95,6 +95,17 @@ if (!result.scanSummary.complete) {
 other reason; those do not stop the scan, since one bad response says nothing
 about the next file.
 
+## What a 404 means
+
+GitHub answers `404` rather than `403` for a repository the caller may not see, so "not found" really means "not visible to you". `githubNotFoundError(hasToken)` splits the two cases, because they have different fixes:
+
+| `githubToken` | Message |
+|---|---|
+| absent | The repo is private; add a token. |
+| present | The token expired, or it's a fine-grained token whose repository access doesn't cover this repo. |
+
+Reporting both as "add a token" sends someone who already has one nowhere.
+
 ## Risk scoring
 
 Findings are weighted by severity (`critical` 0.4, `high` 0.25, `medium` 0.15, `low` 0.05, `info` 0.01), summed, and capped at 1.0. The pre-cap sum is also returned as `rawRiskScore`, and `factors[]` carries one entry per deduped signal with the confidence-adjusted weight actually counted — factor weights always sum to `rawRiskScore`, so a consumer-rendered deduction breakdown reconciles with the score. `getRiskLevel` maps the score to a level using the shared `RISK_THRESHOLDS` (`< 0.3` low, `< 0.6` medium, otherwise high) — with one override: a single `critical` finding always forces `high`, since a lone backdoor or keylogger shouldn't average down to "review before cloning" just because nothing else in the repo was flagged. Pass `findings` as the scanner does (`getRiskLevel(score, findings)`) to get this floor; omit it to fall back to threshold-only scoring. The GitHub **user** scanner uses its own tuned thresholds because profile signals (account age, follower ratios) distribute differently from code findings.

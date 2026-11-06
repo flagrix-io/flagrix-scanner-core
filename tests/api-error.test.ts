@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { githubApiError } from "../src/github/api-error"
+import { githubApiError, githubNotFoundError } from "../src/github/api-error"
 
 function response(
   status: number,
@@ -68,5 +68,23 @@ describe("githubApiError", () => {
   it("supports a custom fallback label", async () => {
     const err = await githubApiError(new Response("x", { status: 502 }), "Failed to fetch events")
     expect(err.message).toBe("Failed to fetch events: 502")
+  })
+})
+
+describe("githubNotFoundError", () => {
+  it("reads a tokenless 404 as a private repository", () => {
+    const message = githubNotFoundError(false).message
+    expect(message).toContain("private repository")
+    expect(message).toContain("Flagrix settings")
+  })
+
+  it("blames the token when one was sent, not the repo's visibility", () => {
+    // The case a user hits months in: the token expired, or it is a
+    // fine-grained token that no longer covers this repo. Telling them to add
+    // a token they already have is the one answer that helps nobody.
+    const message = githubNotFoundError(true).message
+    expect(message).toContain("expired")
+    expect(message).not.toContain("private repository")
+    expect(message).toContain("404")
   })
 })

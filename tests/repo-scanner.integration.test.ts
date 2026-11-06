@@ -903,3 +903,36 @@ describe("scanGitHubRepo coverage honesty", () => {
     expect(api.contentReads()).toBe(10)
   })
 })
+
+describe("scanGitHubRepo 404 diagnosis", () => {
+  /** Everything the scan asks for answers 404, the way GitHub hides a repo. */
+  function mockInvisibleRepo() {
+    const seen: string[] = []
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(String((init?.headers as Record<string, string>)?.Authorization ?? ""))
+      return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 })
+    }) as unknown as typeof fetch
+    return { authHeaders: () => seen }
+  }
+
+  it("reads a 404 without a token as a private repository", async () => {
+    mockInvisibleRepo()
+    await expect(
+      scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+    ).rejects.toThrow(/private repository/i)
+  })
+
+  it("blames the token when one was sent", async () => {
+    // GitHub answers 404 for a repo the caller may not see, so a token that
+    // expired or never covered this repo looks identical to a private one.
+    // Telling someone who has a token to add a token is the dead end.
+    const api = mockInvisibleRepo()
+    await expect(
+      scanGitHubRepo(repoInfo, {
+        signatures: EMPTY_SIGNATURES,
+        githubToken: "ghp_expired"
+      })
+    ).rejects.toThrow(/token can't see this repository/i)
+    expect(api.authHeaders()[0]).toBe("Bearer ghp_expired")
+  })
+})
