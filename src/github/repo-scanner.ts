@@ -83,18 +83,80 @@ const SCANNABLE_EXTENSIONS = [
  * run on source files alone — and they are read before source files so the
  * per-scan file cap can never push them out.
  */
+// `Dockerfile`, `Dockerfile.prod`, `prod.Dockerfile`, `Dockerfile-dev`.
+const CONTAINER_BUILD_FILE = /(?:^|\/)(?:[\w.-]+[-.])?(?:Dockerfile|Containerfile)(?:[-.][\w.-]+)?$/i
+const COMPOSE_FILE = /(?:^|\/)(?:[\w-]+-)?compose(?:\.[\w-]+)*\.ya?ml$/i
+
 const CONFIG_FILE_PATTERNS: RegExp[] = [
   /(?:^|\/)\.vscode\/(?:tasks|settings|launch|mcp)\.json$/,
   /(?:^|\/)\.claude\/settings(?:\.local)?\.json$/,
   /(?:^|\/)\.(?:cursor|amazonq|gemini|windsurf|roo|kiro)\/(?:mcp|settings)\.json$/,
   /(?:^|\/)\.mcp\.json$/,
+  // devcontainer: initializeCommand runs on the host, and
+  // onCreate/postCreateCommand the moment an editor opens the folder.
+  /(?:^|\/)\.devcontainer\.json$/,
+  /(?:^|\/)\.devcontainer\/(?:[^/]+\/)?devcontainer\.json$/,
+  // `docker build` / `docker compose up` is a one-command execution path:
+  // RUN steps, `command:`, privileged containers, docker-socket mounts.
+  CONTAINER_BUILD_FILE,
+  COMPOSE_FILE,
   /^\.github\/workflows\/[^/]+\.ya?ml$/,
-  /^README(?:\.md|\.txt|\.rst)?$/i,
+  /(?:^|\/)README(?:\.md|\.txt|\.rst)?$/i,
   /(?:^|\/)(?:AGENTS|CLAUDE|GEMINI)\.md$/,
   /(?:^|\/)\.(?:cursorrules|windsurfrules|clinerules)$/,
-  /(?:^|\/)\.cursor\/rules\/[^/]+\.mdc?$/,
+  /(?:^|\/)\.cursor\/rules\/.*\.mdc?$/,
+  // Prompts, slash commands, subagents and skills: markdown a coding agent
+  // executes on request, with the same reach as a hook.
+  /(?:^|\/)\.claude\/(?:commands|agents)\/.*\.md$/,
+  /(?:^|\/)\.claude\/skills\/[^/]+\/SKILL\.md$/,
   /^\.github\/copilot-instructions\.md$/,
+  /^\.github\/(?:instructions|prompts)\/[^/]+\.md$/,
 ]
+
+/**
+ * Rule scope for configs whose file name, not its extension, says what it is.
+ * A Dockerfile's content is shell and a compose file's is YAML, so each keeps
+ * the generic suffix (every `.sh` / `.yml` rule still applies) behind a
+ * type-specific one, which is how a rule targets just that file type:
+ * `.dockerfile.sh` for container builds, `.compose.yml` for compose files.
+ * Name lists cannot do this job — `Dockerfile.prod` and `prod.Dockerfile`
+ * are the same file type under a different basename.
+ */
+function configRuleScope(path: string): string {
+  if (CONTAINER_BUILD_FILE.test(path)) return `${path}.dockerfile.sh`
+  if (COMPOSE_FILE.test(path)) return `${path}.compose.yml`
+  return path
+}
+
+/**
+ * Instruction files an agent obeys and plain docs. They are read, but they
+ * claim the config budget only after the configs that a tool executes —
+ * a monorepo's nested READMEs must not push out a devcontainer or hook file.
+ */
+const INSTRUCTION_CONFIG = /(?:^|\/)(?:AGENTS|CLAUDE|GEMINI)\.md$|(?:^|\/)\.(?:cursorrules|windsurfrules|clinerules)$|(?:^|\/)\.cursor\/rules\/|(?:^|\/)\.claude\/(?:commands|agents|skills)\/|^\.github\/(?:copilot-instructions\.md$|(?:instructions|prompts)\/)/
+const README_CONFIG = /(?:^|\/)README(?:\.md|\.txt|\.rst)?$/i
+
+/**
+ * Stable sort by priority: files of equal priority keep their tree order, so
+ * selection stays deterministic for the same commit.
+ */
+function sortByPriority(
+  items: GitHubTreeItem[],
+  priority: (path: string) => number
+): void {
+  const rank = new Map(items.map((item, index) => [item, index]))
+  items.sort(
+    (a, b) =>
+      priority(a.path) - priority(b.path) || rank.get(a)! - rank.get(b)!
+  )
+}
+
+/** 0 = executed by a tool, 1 = instructions an agent obeys, 2 = docs. */
+function configPriority(path: string): number {
+  if (README_CONFIG.test(path)) return 2
+  if (INSTRUCTION_CONFIG.test(path)) return 1
+  return 0
+}
 
 const UTF8 = new TextDecoder("utf-8")
 
@@ -134,7 +196,13 @@ const MAX_CONFIG_FILES = 25
  * they routinely run test suites that evaluate generated code.
  */
 const MAX_COMMAND_TARGETS = 10
+// CI workflows run on CI runners and container builds inside a container,
+// not on the cloner's machine, so their steps are not followed as host
+// commands. A devcontainer is not in here: initializeCommand runs on the host.
 const CI_WORKFLOW = /^\.github\/workflows\//
+function runsOffHost(path: string): boolean {
+  return CI_WORKFLOW.test(path) || CONTAINER_BUILD_FILE.test(path) || COMPOSE_FILE.test(path)
+}
 const RUNTIME_INVOCATION =
   /\b(?:node|nodejs|bun|deno\s+run|tsx|ts-node)((?:\s+-{1,2}[\w-]+(?:=[^\s"'`]*)?)*)\s+\\?["']?([^\s"'`&|;<>()]+)/g
 // `node -e <code>` / `-p` take inline code, not a file.
@@ -143,9 +211,9 @@ const RUNTIME_ARGS_FORM =
   /"command"\s*:\s*"(?:node|nodejs|bun|deno|tsx|ts-node)"\s*,\s*"args"\s*:\s*\[\s*"([^"]+)"/g
 // Variables that name the folder a config runs from (VS Code, Claude Code).
 const PROJECT_DIR_VARIABLE =
-  /\\?["']?\$\{?(?:CLAUDE_PROJECT_DIR|workspaceFolder|workspaceRoot)\}?\\?["']?(?=\/)/g
+  /\\?["']?\$\{?(?:CLAUDE_PROJECT_DIR|workspaceFolder|workspaceRoot|localWorkspaceFolder|containerWorkspaceFolder)\}?\\?["']?(?=\/)/g
 // Configs inside these dot-dirs run from the folder that holds the dot-dir.
-const DOT_DIR_CONFIG = /^(?:(.*)\/)?\.(?:vscode|claude|cursor|amazonq|gemini|windsurf|roo|kiro|github)\//
+const DOT_DIR_CONFIG = /^(?:(.*)\/)?\.(?:vscode|claude|cursor|amazonq|gemini|windsurf|roo|kiro|github|devcontainer)\//
 
 /** Repo paths that a config file runs with node/bun/deno/tsx. */
 export function extractCommandTargets(content: string, configPath: string): string[] {
@@ -184,6 +252,31 @@ function resolveRepoPath(base: string, raw: string): string | null {
 }
 
 const MAX_FILES_TO_SCAN = 200
+
+/**
+ * When a repo has more scannable sources than the cap, which ones to read
+ * first. Tree order alone spends the budget alphabetically: a monorepo's
+ * `apps/.../*.test.tsx` crowd out `scripts/*.ts` and `postcss.config.js`,
+ * which is backwards — every data-driven rule skips test files
+ * (`applyYaraRules` returns early on them), while build and install scripts
+ * are what actually runs on a clone, and PolinRider-style loaders are
+ * appended to next / tailwind / postcss configs. Sorting also sets the fetch
+ * order, so a scan that hits the rate limit has already read the files that
+ * matter most.
+ */
+const RUNS_ON_INSTALL_OR_BUILD =
+  /^(?:scripts?|bin|tools?)\/|(?:^|\/)(?:pre|post)?install\.(?:[cm]?js|ts)$|(?:^|\/)setup\.(?:[cm]?js|ts|py)$|(?:^|\/)[\w.-]*\.config\.(?:[cm]?js|ts)$|^\.(?:husky|github|vscode|claude|cursor|devcontainer)\//
+const GENERATED_OR_VENDORED =
+  /(?:^|\/)(?:dist|build|out|vendor|third_party|node_modules|coverage)\/|\.min\.[cm]?js$|\.bundle\.[cm]?js$|(?:^|\/)[\w.-]*\.generated\.[cm]?[jt]sx?$/
+const SUPPORTING_SOURCE = /(?:^|\/)(?:__mocks__|mocks?|examples?|samples?|demos?)\//i
+
+/** 0 = runs on install/build, 1 = ordinary source, 2 = tests and samples, 3 = artifacts. */
+function sourcePriority(path: string): number {
+  if (GENERATED_OR_VENDORED.test(path)) return 3
+  if (isTestFile(path) || SUPPORTING_SOURCE.test(path)) return 2
+  if (RUNS_ON_INSTALL_OR_BUILD.test(path)) return 0
+  return 1
+}
 // Blobs above this are skipped ("too-large"): almost always bundles or
 // vendored artifacts, and fetching them dominates scan time on big repos.
 const MAX_FILE_SIZE_BYTES = 1024 * 1024
@@ -311,24 +404,26 @@ export async function scanGitHubRepo(
     // Editor/agent/CI configs and a few small fonts get their own budget on
     // top of the source cap, so adding them never displaces source coverage
     // (sharing one cap pushed 5–38 source files out of large repos).
-    const extraFiles: GitHubTreeItem[] = []
-    let configSelected = 0
-    let fontsSelected = 0
+    const configCandidates: GitHubTreeItem[] = []
+    const fontFiles: GitHubTreeItem[] = []
     const sourceBlobs: GitHubTreeItem[] = []
     for (const item of tree.tree) {
       if (item.type !== "blob") continue
-      const config = isConfigFile(item.path)
+      // A source extension wins over a config pattern: `Dockerfile.ts` is a
+      // script to scan with the full detectors, not a container build.
+      const config =
+        isConfigFile(item.path) &&
+        !SCANNABLE_EXTENSIONS.some((ext) => item.path.endsWith(ext))
       const font = !config && isFontFile(item.path)
       if (config || font) {
         const sizeLimit = font ? MAX_FONT_BYTES : MAX_FILE_SIZE_BYTES
         if (item.size !== undefined && item.size > sizeLimit) {
           skip(item.path, "too-large")
-        } else if (config ? configSelected >= MAX_CONFIG_FILES : fontsSelected >= MAX_FONT_FILES) {
-          skip(item.path, "over-file-limit")
+        } else if (font) {
+          if (fontFiles.length >= MAX_FONT_FILES) skip(item.path, "over-file-limit")
+          else fontFiles.push(item)
         } else {
-          if (config) configSelected++
-          else fontsSelected++
-          extraFiles.push(item)
+          configCandidates.push(item)
         }
         continue
       }
@@ -339,13 +434,23 @@ export async function scanGitHubRepo(
         skip(item.path, "unsupported-type")
       } else if (item.size !== undefined && item.size > MAX_FILE_SIZE_BYTES) {
         skip(item.path, "too-large")
-      } else if (sourceBlobs.length >= MAX_FILES_TO_SCAN) {
-        skip(item.path, "over-file-limit")
       } else {
         sourceBlobs.push(item)
       }
     }
-    const filesToScan = [...extraFiles, ...sourceBlobs]
+    sortByPriority(sourceBlobs, sourcePriority)
+    for (const item of sourceBlobs.splice(MAX_FILES_TO_SCAN)) {
+      skip(item.path, "over-file-limit")
+    }
+    // Spend the config budget on the configs a tool executes before the ones
+    // it merely reads (configPriority), so widening the set never costs
+    // coverage of the auto-run files. Tree order is kept inside each tier.
+    const configFiles = configCandidates
+    sortByPriority(configFiles, configPriority)
+    for (const item of configFiles.splice(MAX_CONFIG_FILES)) {
+      skip(item.path, "over-file-limit")
+    }
+    const filesToScan = [...configFiles, ...fontFiles, ...sourceBlobs]
     // Command targets discovered while reading configs join the queue later;
     // every blob is either queued or skipped, so a target is moved out of
     // the skipped list when it is queued.
@@ -435,7 +540,7 @@ export async function scanGitHubRepo(
       const content = isFontFile(file.path) ? binary : decodeUtf8(binary)
 
       if (
-        (isConfigFile(file.path) && !CI_WORKFLOW.test(file.path)) ||
+        (isConfigFile(file.path) && !runsOffHost(file.path)) ||
         file.path.endsWith("package.json")
       ) {
         for (const target of extractCommandTargets(content, file.path)) {
@@ -502,10 +607,15 @@ export async function scanGitHubRepo(
       // Editor/agent/CI configs, docs and package manifests: data-driven
       // rules only (scoped by each rule's fileExtensions / fileNames).
       if (!isSource && (isConfigFile(file.path) || file.path.endsWith("package.json"))) {
-        const configFindings = applyYaraRules(content, yaraRules, file.path)
+        const configFindings = applyYaraRules(
+          content,
+          yaraRules,
+          file.path,
+          configRuleScope(file.path)
+        )
         findings.push(...configFindings)
         patternsMatched += configFindings.length
-        if (/^README/i.test(file.path)) {
+        if (/^README/i.test(file.path.split("/").pop() ?? file.path)) {
           const socialFindings = detectSocialEngineering(content, file.path)
           findings.push(...socialFindings)
           patternsMatched += socialFindings.length

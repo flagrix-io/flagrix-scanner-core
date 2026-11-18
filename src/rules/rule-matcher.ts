@@ -111,10 +111,12 @@ export function applyYaraRules(
       ) {
         continue
       }
+      // Name gates read the real path: scopePath says how to *read* a file
+      // (an HTML template or a Dockerfile scanned as script), not what it is.
       if (
         rule.fileNames &&
         rule.fileNames.length > 0 &&
-        !rule.fileNames.includes(scopePath.split("/").pop() ?? scopePath)
+        !rule.fileNames.includes(filePath.split("/").pop() ?? filePath)
       ) {
         continue
       }
