@@ -7,7 +7,11 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { extractCommandTargets, scanGitHubRepo } from "../src/github/repo-scanner"
+import {
+  FETCH_CONCURRENCY,
+  extractCommandTargets,
+  scanGitHubRepo,
+} from "../src/github/repo-scanner"
 import type { SignatureDatabase } from "../src/types/index"
 
 const EMPTY_SIGNATURES: SignatureDatabase = {
@@ -879,10 +883,26 @@ describe("scanGitHubRepo coverage honesty", () => {
   })
 
   it("stops asking GitHub once the budget is spent", async () => {
-    const api = mockSpentBudgetApi(tenCleanFiles, 3)
+    // Files are read FETCH_CONCURRENCY at a time, so a refusal is noticed
+    // with a window of reads already in flight: the overshoot past it is
+    // bounded by that window, not by the length of the queue. Queue several
+    // times the window, so that bound is what is under test — a far longer
+    // queue must not cost proportionally more refused requests.
+    const manyCleanFiles = Object.fromEntries(
+      Array.from({ length: FETCH_CONCURRENCY * 5 }, (_, i) => [
+        `src/mod${i}.js`,
+        `export const n${i} = ${i}\n`,
+      ])
+    )
+    const api = mockSpentBudgetApi(manyCleanFiles, 3)
     await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
-    // 3 served + 1 refusal; the remaining 6 are never requested.
-    expect(api.contentReads()).toBe(4)
+
+    // It kept asking past the 3 that were served — that is how the refusal
+    // gets discovered at all.
+    expect(api.contentReads()).toBeGreaterThan(3)
+    // And then it stopped, instead of walking the whole queue into the wall.
+    expect(api.contentReads()).toBeLessThanOrEqual(FETCH_CONCURRENCY * 2)
+    expect(api.contentReads()).toBeLessThan(Object.keys(manyCleanFiles).length)
   })
 
   it("treats a secondary rate limit the same as the hourly one", async () => {
@@ -1179,5 +1199,82 @@ describe("which source files the per-scan cap keeps", () => {
     expect(result.scanSummary.skippedFiles.map((s) => s.path)).toEqual([
       "src/f200.js", "src/f201.js", "src/f202.js", "src/f203.js", "src/f204.js"
     ])
+  })
+})
+
+describe("how files are read", () => {
+  /**
+   * A fetch mock that records how many content reads overlap, and can hold
+   * each read open for a per-path delay so completion order is controllable
+   * independently of request order.
+   */
+  function mockTimedApi(files: Record<string, string>, delayFor: (path: string) => number) {
+    let inFlight = 0
+    let maxInFlight = 0
+    const completionOrder: string[] = []
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (/\/commits\/[^/]+$/.test(url)) {
+        return new Response(JSON.stringify({ sha: MOCK_COMMIT_SHA }), { status: 200 })
+      }
+      if (url.includes("/git/trees/")) {
+        const tree = Object.keys(files).map((path) => ({
+          path,
+          type: "blob" as const,
+          sha: path,
+          url: path
+        }))
+        return new Response(JSON.stringify({ sha: "x", truncated: false, tree }), {
+          status: 200
+        })
+      }
+      const contentMatch = url.match(/\/contents\/(.+?)\?ref=/)
+      if (contentMatch) {
+        const path = decodeURIComponent(contentMatch[1]!)
+        inFlight++
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        await new Promise((resolve) => setTimeout(resolve, delayFor(path)))
+        inFlight--
+        completionOrder.push(path)
+        const b64 = Buffer.from(files[path] ?? "", "utf-8").toString("base64")
+        return new Response(JSON.stringify({ content: b64 }), { status: 200 })
+      }
+      return new Response("{}", { status: 404 })
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+    return { maxInFlight: () => maxInFlight, completionOrder: () => completionOrder }
+  }
+
+  it("reads files concurrently rather than one at a time", async () => {
+    const files = Object.fromEntries(
+      Array.from({ length: 24 }, (_, i) => [`src/mod${i}.js`, `export const n${i} = ${i}\n`])
+    )
+    const api = mockTimedApi(files, () => 5)
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+
+    expect(result.scanSummary.filesScanned).toBe(24)
+    // Serial reads are what made a scan of a large repo take minutes.
+    expect(api.maxInFlight()).toBeGreaterThan(1)
+    // But the window stays bounded, so a big repo cannot burst at GitHub.
+    expect(api.maxInFlight()).toBeLessThanOrEqual(FETCH_CONCURRENCY)
+  })
+
+  it("accounts for files in queue order even when reads finish out of order", async () => {
+    // Reverse the delays so the LAST file queued is the FIRST to come back.
+    // Order matters beyond tidiness: deduped findings keep the description
+    // of the first match seen, so completion order must not leak into the
+    // result.
+    const paths = Array.from({ length: 12 }, (_, i) => `src/mod${i}.js`)
+    const files = Object.fromEntries(paths.map((p, i) => [p, `export const n${i} = ${i}\n`]))
+    const api = mockTimedApi(files, (path) => {
+      const index = Number(path.match(/mod(\d+)/)![1])
+      return (paths.length - index) * 4
+    })
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+
+    // The mock really did complete them backwards...
+    expect(api.completionOrder()[0]).toBe("src/mod11.js")
+    // ...yet the scan recorded them in the order it queued them.
+    expect(result.scanSummary.scannedFiles).toEqual(paths)
   })
 })
