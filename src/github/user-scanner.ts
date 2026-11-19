@@ -60,26 +60,31 @@ async function fetchUserFeatures(
     headers["Authorization"] = `Bearer ${githubToken}`
   }
 
-  const userResponse = await fetch(`https://api.github.com/users/${username}`, { headers })
+  // None of the three depends on another, so they go out together: three
+  // round trips in sequence was the whole cost of a profile scan. Errors are
+  // still reported in the original order — the user lookup first, so a
+  // missing account reads as "not found" rather than as a repo failure.
+  const [userResponse, reposResponse, eventsResponse] = await Promise.all([
+    fetch(`https://api.github.com/users/${username}`, { headers }),
+    fetch(
+      `https://api.github.com/users/${username}/repos?per_page=100&sort=updated`,
+      { headers }
+    ),
+    fetch(
+      `https://api.github.com/users/${username}/events/public?per_page=30`,
+      { headers }
+    ),
+  ])
+
   if (!userResponse.ok) {
     if (userResponse.status === 404) throw new Error(`User "${username}" not found`)
     throw await githubApiError(userResponse)
   }
-  const user: GitHubAPIUser = await userResponse.json()
-
-  const reposResponse = await fetch(
-    `https://api.github.com/users/${username}/repos?per_page=100&sort=updated`,
-    { headers }
-  )
   if (!reposResponse.ok) throw await githubApiError(reposResponse, "Failed to fetch repositories")
-  const repos: GitHubAPIRepo[] = await reposResponse.json()
-
-  const eventsResponse = await fetch(
-    `https://api.github.com/users/${username}/events/public?per_page=30`,
-    { headers }
-  )
   if (!eventsResponse.ok) throw await githubApiError(eventsResponse, "Failed to fetch events")
-  const events: GitHubAPIEvent[] = await eventsResponse.json()
+
+  const [user, repos, events]: [GitHubAPIUser, GitHubAPIRepo[], GitHubAPIEvent[]] =
+    await Promise.all([userResponse.json(), reposResponse.json(), eventsResponse.json()])
 
   const now = Date.now()
   const accountAgeDays = Math.floor((now - new Date(user.created_at).getTime()) / 86400000)
