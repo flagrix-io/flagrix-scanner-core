@@ -234,3 +234,25 @@ describe("data-driven regex performance", () => {
     expect(applyYaraRules(characterCodes, [rule], "src/payload.ts")).toHaveLength(1)
   })
 })
+
+describe("test-suite naming (false positive fixed in 0.7.1)", () => {
+  // esbuild keeps its suite in scripts/*-tests.js. Read as a build script
+  // with string literals unmasked, the eval / new Function / fromCharCode
+  // cases a bundler's own tests must contain matched as malware at critical
+  // severity, and the repo verdicted HIGH with safeToClone false.
+  it("recognises a suite named by its basename, not by a tests/ folder", () => {
+    expect(isTestFile("scripts/end-to-end-tests.js")).toBe(true)
+    expect(isTestFile("scripts/js-api-tests.js")).toBe(true)
+    expect(isTestFile("scripts/parser-test.ts")).toBe(true)
+    expect(isTestFile("src/api.tests.js")).toBe(true)
+    expect(isTestFile("scripts/test.mjs")).toBe(true)
+  })
+
+  it("does not read a test suffix into an ordinary word", () => {
+    expect(isTestFile("src/latest.js")).toBe(false)
+    expect(isTestFile("src/contest.ts")).toBe(false)
+    expect(isTestFile("src/protest.js")).toBe(false)
+    expect(isTestFile("scripts/attestation.js")).toBe(false)
+    expect(isTestFile("scripts/esbuild.js")).toBe(false)
+  })
+})

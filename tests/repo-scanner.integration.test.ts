@@ -1278,3 +1278,40 @@ describe("how files are read", () => {
     expect(result.scanSummary.scannedFiles).toEqual(paths)
   })
 })
+
+describe("backdoor pattern precision (false positive fixed in 0.7.1)", () => {
+  // `new Function('module', 'exports', 'require', src)` is the CommonJS module
+  // wrapper every bundler and module loader writes. The pattern matched a bare
+  // `req`, so the string 'require' made it a critical backdoor — the finding
+  // that kept esbuild's own build script at a HIGH, unsafe-to-clone verdict.
+  it("does not call the CommonJS module wrapper a backdoor", async () => {
+    const result = await scan({
+      "scripts/build.js":
+        "const run = new Function('module', 'exports', 'require', source)\n" +
+        "run(module, module.exports, require)\n",
+    })
+    expect(result.findings.filter((f) => f.type === "BACKDOOR")).toEqual([])
+  })
+
+  it("still flags a Function built from request data", async () => {
+    const result = await scan({
+      "src/server.js":
+        "app.post('/x', (req, res) => {\n" +
+        "  const fn = new Function(req.body.code)\n" +
+        "  fn()\n" +
+        "})\n",
+    })
+    const backdoors = result.findings.filter((f) => f.type === "BACKDOOR")
+    expect(backdoors.length).toBeGreaterThan(0)
+    expect(backdoors.some((f) => f.severity === "critical")).toBe(true)
+  })
+
+  it("flags a Function built from a bracketed request property too", async () => {
+    const result = await scan({
+      "src/server.js": "const fn = new Function(request['payload'])\nfn()\n",
+    })
+    expect(
+      result.findings.some((f) => f.type === "BACKDOOR" && f.severity === "critical")
+    ).toBe(true)
+  })
+})

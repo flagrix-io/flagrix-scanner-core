@@ -1767,7 +1767,13 @@ function detectBackdoors(
     { pattern: /eval\s*\(\s*(?:request|req)(?:\.|\.body|\.query)/gi, type: "Remote Code Execution Endpoint", severity: "critical" as const, ruleId: "BACKDOOR_RCE_ENDPOINT" },
     { pattern: /exec\s*\(\s*(?:request|req)(?:\.|\.body|\.query)/gi, type: "Command Injection Endpoint", severity: "critical" as const, ruleId: "BACKDOOR_RCE_ENDPOINT" },
     { pattern: /require\s*\(\s*(?:request|req)(?:\.|\.body|\.query)/gi, type: "Dynamic Require", severity: "critical" as const, ruleId: "BACKDOOR_DYNAMIC_REQUIRE" },
-    { pattern: /new\s+Function\s*\([^)]*(?:request|req)/gi, type: "Dynamic Function from Request", severity: "critical" as const, ruleId: null },
+    // The request has to be read as data (`req.body`, `req["x"]`), the way
+    // the three patterns above all require. Matching a bare `req` flagged
+    // `new Function('module', 'exports', 'require', src)` — the CommonJS
+    // module wrapper every bundler and module loader writes — as a critical
+    // backdoor, because `require` begins with `req`. esbuild's own build
+    // script tripped it.
+    { pattern: /new\s+Function\s*\([^)]*\b(?:request|req)\s*(?:\.|\[)/gi, type: "Dynamic Function from Request", severity: "critical" as const, ruleId: null },
     { pattern: /(?:password|auth)\s*(?:===?|==)\s*['"][^'"]{0,20}['"]\s*\)/gi, type: "Hardcoded Auth Bypass", severity: "critical" as const, ruleId: "BACKDOOR_HARDCODED_AUTH" },
   ].filter(({ ruleId }) => !ruleId || !coveredRuleIds.has(ruleId))
 

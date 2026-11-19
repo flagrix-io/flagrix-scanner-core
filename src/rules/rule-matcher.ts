@@ -10,6 +10,15 @@ const TEST_FILE_PATTERNS = [
   /\.test\.[jt]sx?$/i,
   /\.spec\.[jt]sx?$/i,
   /_test\.[jt]sx?$/i,
+  // A suite named by its basename rather than by a `tests/` folder or a
+  // `.test.` infix: `js-api-tests.js`, `end-to-end-tests.js`, `parser-test.ts`.
+  // esbuild keeps its suite in `scripts/*-tests.js`, which every pattern above
+  // misses, so those files were read as build scripts with their string
+  // literals unmasked — and the `eval`, `new Function` and `fromCharCode`
+  // cases a bundler's own tests must contain matched as malware at critical
+  // severity. The separator class is what keeps this narrow: `latest.js` and
+  // `contest.js` have no separator before `test`, so they are untouched.
+  /(?:^|[/\-_.])tests?\.[cm]?[jt]sx?$/i,
   /\.mock\.[jt]sx?$/i,
   /fixtures?\//i,
   /cypress\.config\.[jt]sx?$/i,
