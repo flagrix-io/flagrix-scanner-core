@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { scanGitHubRepo } from "../src/github/repo-scanner"
-import { compareVersions, matchOsvFeed, pythonDependencies } from "../src/github/osv-feed"
+import { compareVersions, matchOsvFeed, npmDependencies, pythonDependencies, resolveNpmAlias } from "../src/github/osv-feed"
 import type { OsvMaliciousFeed, SignatureDatabase } from "../src/types/index"
 
 const SIGNATURES: SignatureDatabase = {
@@ -13,7 +13,7 @@ const SIGNATURES: SignatureDatabase = {
 
 const FEED: OsvMaliciousFeed = {
   schemaVersion: 1,
-  npm: { all: ["curated-bad", "evil-every-version", "internal-utils"], versions: { "evil-one-release": ["1.0.1"] } },
+  npm: { all: ["curated-bad", "evil-every-version", "internal-utils", "squatted-alias-key"], versions: { "evil-one-release": ["1.0.1"] } },
   pypi: { all: ["foo-bar"], versions: { "pinned-bad": ["2.0.0"] } }
 }
 
@@ -99,5 +99,106 @@ describe("OSV malicious-package feed", () => {
   it("does nothing without a feed", async () => {
     serve({ "package.json": JSON.stringify({ dependencies: { "evil-every-version": "1.0.0" } }) })
     expect(osvFindings(await scanGitHubRepo(repo, { signatures: SIGNATURES }))).toEqual([])
+  })
+})
+
+describe("npm alias dependencies", () => {
+  it("reads the aliased package, not the local name it is installed under", () => {
+    expect(resolveNpmAlias("hooks-published", "npm:eslint-plugin-react-hooks@^5.2.0")).toEqual({
+      name: "eslint-plugin-react-hooks",
+      spec: "^5.2.0",
+    })
+    // A scoped target keeps its leading @: the separator is the last one.
+    expect(resolveNpmAlias("x", "npm:@scope/pkg@1.2.3")).toEqual({
+      name: "@scope/pkg",
+      spec: "1.2.3",
+    })
+    // No version on the target: npm installs whatever `*` resolves to.
+    expect(resolveNpmAlias("x", "npm:@scope/pkg")).toEqual({ name: "@scope/pkg", spec: "*" })
+    expect(resolveNpmAlias("x", "npm:lodash")).toEqual({ name: "lodash", spec: "*" })
+    // An ordinary dependency is left exactly as it is.
+    expect(resolveNpmAlias("lodash", "^4.17.21")).toEqual({ name: "lodash", spec: "^4.17.21" })
+    expect(resolveNpmAlias("local", "file:../local")).toEqual({ name: "local", spec: "file:../local" })
+  })
+
+  it("does not report an alias key that npm never resolves from the registry", async () => {
+    // facebook/react declares exactly this. Malicious packages have since
+    // been published under the alias names, but react installs
+    // eslint-plugin-react-hooks, so they are never fetched.
+    serve({
+      "package.json": JSON.stringify({
+        name: "app",
+        devDependencies: { "squatted-alias-key": "npm:eslint-plugin-react-hooks@^5.2.0" },
+      }),
+    })
+    const result = await scanGitHubRepo(repo, { signatures: SIGNATURES, osvFeed: FEED })
+    expect(osvFindings(result)).toHaveLength(0)
+  })
+
+  it("reports the package an alias actually installs", async () => {
+    // The other direction: the key is innocuous and the target is what
+    // gets installed.
+    serve({
+      "package.json": JSON.stringify({
+        name: "app",
+        dependencies: { lodash: "npm:evil-every-version@1.0.0" },
+      }),
+    })
+    const result = await scanGitHubRepo(repo, { signatures: SIGNATURES, osvFeed: FEED })
+    const findings = osvFindings(result)
+    expect(findings).toHaveLength(1)
+    expect(findings[0]!.package).toBe("evil-every-version")
+  })
+
+  it("matches the aliased target's version range, not the alias specifier", () => {
+    const deps = npmDependencies(
+      { dependencies: { pinned: "npm:evil-one-release@1.0.1" } },
+      "package.json"
+    )
+    expect(deps).toEqual([
+      { ecosystem: "npm", name: "evil-one-release", spec: "1.0.1", file: "package.json" },
+    ])
+    const findings = matchOsvFeed(FEED, deps, new Set(), new Set())
+    expect(findings).toHaveLength(1)
+    expect(findings[0]!.confidence).toBe("high")
+  })
+})
+
+describe("version ranges written to exclude a malicious release", () => {
+  const feed: OsvMaliciousFeed = {
+    schemaVersion: 1,
+    npm: { all: [], versions: { "file-entry-cache": ["11.1.6"] } },
+    pypi: { all: [], versions: {} },
+  }
+  const match = (spec: string) =>
+    matchOsvFeed(
+      feed,
+      [{ ecosystem: "npm", name: "file-entry-cache", spec, file: "package.json" }],
+      new Set(),
+      new Set()
+    )
+
+  it("does not report a range that pins around the affected version", () => {
+    // eslint's own declaration. OSV flags 11.1.6 and this excludes exactly
+    // that version.
+    expect(match("11.1.5 || >11.1.6 <12")).toHaveLength(0)
+    expect(match(">11.1.6")).toHaveLength(0)
+    expect(match("<11.1.6")).toHaveLength(0)
+  })
+
+  it("still reports a range that admits the affected version", () => {
+    expect(match(">=11.1.6 <12")).toHaveLength(1)
+    expect(match(">11.1.5 <12")).toHaveLength(1)
+    expect(match("<=11.1.6")).toHaveLength(1)
+  })
+
+  it("still reports the affected version pinned outright", () => {
+    const findings = match("11.1.6")
+    expect(findings).toHaveLength(1)
+    expect(findings[0]!.confidence).toBe("high")
+  })
+
+  it("keeps reporting a range declaration as lower confidence than a pin", () => {
+    expect(match(">=11.1.6 <12")[0]!.confidence).toBe("medium")
   })
 })

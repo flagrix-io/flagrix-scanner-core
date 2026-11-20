@@ -256,3 +256,25 @@ describe("test-suite naming (false positive fixed in 0.7.1)", () => {
     expect(isTestFile("scripts/esbuild.js")).toBe(false)
   })
 })
+
+describe("checkTyposquat on short names", () => {
+  it("does not link unrelated short packages", () => {
+    // `jsr` is Deno's registry client and two edits from `jest`, which made
+    // zod a typosquat host. Two edits only mean "typo" on a name long enough
+    // to survive them.
+    expect(checkTyposquat("jsr")).toBeNull()
+    expect(checkTyposquat("ms")).toBeNull()
+    expect(checkTyposquat("qs")).toBeNull()
+    expect(checkTyposquat("nub")).toBeNull()
+  })
+
+  it("still catches a one-edit slip on a short name", () => {
+    expect(checkTyposquat("jst")).toBe("jest")
+    expect(checkTyposquat("jes")).toBe("jest")
+  })
+
+  it("still catches two edits once the name is long enough", () => {
+    expect(checkTyposquat("axois")).toBe("axios")
+    expect(checkTyposquat("lodahs")).toBe("lodash")
+  })
+})
