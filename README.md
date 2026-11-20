@@ -18,7 +18,7 @@ Signature data lives in the sibling repo [flagrix-detection-rules](https://githu
 
 ## Privacy — everything runs locally
 
-All analysis happens on the caller's device — there is no Flagrix backend and no telemetry. The library's only network calls are to `api.github.com` (file contents and profile data) and `api.npmjs.org` (package download counts for typosquat checks). Nothing that gets scanned — file contents, repo names, results — is sent to Flagrix or any third-party server. The optional `githubToken` is used exclusively as an `Authorization` header on GitHub API requests; it is never transmitted anywhere else.
+All analysis happens on the caller's device — there is no Flagrix backend and no telemetry. The library's only network calls are to `api.github.com` (file contents and profile data), `codeload.github.com` (the commit tarball, when `tarball: true` is passed) and `api.npmjs.org` (package download counts for typosquat checks). Nothing that gets scanned — file contents, repo names, results — is sent to Flagrix or any third-party server. The optional `githubToken` is used exclusively as an `Authorization` header on GitHub API requests; it is never transmitted anywhere else.
 
 ## What gets scanned
 
@@ -29,6 +29,48 @@ When more source files are eligible than the cap allows, they are read in priori
 On top of that cap, it also reads up to **25 editor, agent and CI config files**, which developer tools execute or obey as soon as a repo is opened: `.vscode/{tasks,settings,launch,mcp}.json`, `.claude/settings(.local).json`, MCP configs (`.mcp.json`, `.cursor/mcp.json`, `.amazonq/mcp.json`, …), `.devcontainer/devcontainer.json`, `Dockerfile`/`Containerfile`, `docker-compose.yml` and other compose files, `.github/workflows/*.yml`, every `README` in the tree, and agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.cursor/rules/**/*.mdc`, `.claude/commands/*.md`, `.claude/agents/*.md`, `.claude/skills/*/SKILL.md`, `.github/{instructions,prompts}/*.md`, …). When more config files match than the budget allows, the ones a tool executes are read first, then agent instruction files, then READMEs. A container build is scanned under the rule scope `.dockerfile.sh` and a compose file under `.compose.yml`, so every generic `.sh` / `.yml` rule still applies while a rule can also target just that file type — which a `fileNames` list cannot do, since `Dockerfile.prod` and `prod.Dockerfile` are the same type under different names. These files and `package.json` get the data-driven rules only, scoped by each rule's `fileExtensions` / `fileNames`. It also reads up to **10 font files** (≤ 512 KB each) and flags any that are really JavaScript (`MASQUERADED_SCRIPT_FONT`). Files that those configs (except CI workflows and container builds, whose steps run on a CI runner or inside a container rather than on your machine) or `package.json` scripts run with `node`/`bun`/`deno`/`tsx` (for example `node .vscode/spellright.dict` or a `preinstall: node setup.mjs`) are read as well, up to **10** per scan and whatever their extension or position in the source cap, and are scanned as JavaScript. Text files are decoded as UTF-8, so rules for invisible Unicode and bidi controls see real code points.
 
 Everything else (other docs, images, data files, oversized blobs) is skipped, and the result says so: `scanSummary.scannedFiles` lists every file that was read, and `scanSummary.skippedFiles` lists what was skipped with a per-file reason (`unsupported-type`, `over-file-limit`, `too-large`, `fetch-failed`, `rate-limited`).
+
+### How much gets read depends on how it is read
+
+The 200-file cap above is a *request* budget, not a work budget: on the default
+path each file costs its own round trip, so bounding the scan means bounding the
+file count. Pass `tarball: true` and the whole commit arrives in one request
+(`/repos/{owner}/{repo}/tarball/{sha}`), file count stops costing anything, and
+the source budget becomes **16 MB of decoded source** instead. The 1 MB-per-file
+limit and the separate config and font budgets are unchanged.
+
+```ts
+await scanGitHubRepo(repo, { signatures, tarball: true })
+```
+
+Measured on `facebook/react`: 226 files in 16.5 s on the per-file path, against
+**4,373 files in 11.5 s** via the tarball — and one rate-limit unit instead of
+231. What bounds the byte budget is memory, not time: the detectors retain every
+file's masked copy for the whole scan, so peak heap runs about 13–14x the source
+read, and 16 MB peaks around 217 MB. That is why the budget is not simply raised
+to cover every repo whole.
+
+It is **off by default**, because asking is not free. The endpoint redirects to
+`codeload.github.com`, so a browser extension needs that origin granted — as an
+*optional* host permission, since a required one is scored as a privilege
+increase and disables the extension until every existing user re-approves it —
+and a request made without it costs a round trip before it fails.
+
+Every failure falls back to the per-file path rather than failing the scan: an
+archive larger than the repo's tree says it should be (decided before any
+request, so nothing is downloaded and abandoned), a refused or unreachable
+endpoint, a body that is not a readable tarball. Files the archive did not carry
+— a symlink, or a config's `node <path>` target found only after the configs
+were read — are fetched individually.
+
+`scanSummary.readMode` reports which reader ran (`"tarball"` or `"per-file"`),
+and `scanSummary.readFallbackReason` why a requested tarball was not used
+(`"too-large"`, `"unavailable"`, `"unreadable"`).
+
+**Consumers must surface `readMode`.** Coverage decides the verdict, so two
+people can get different scores for the same commit depending on which reader
+ran — and for a security tool a verdict that varies silently is worse than one
+that is slow.
 
 The scan also makes two read-only calls for git-history signals: the branch's push activity and its last 100 commits. A commit pushed 30 or more days after its own date is flagged as `GIT_HISTORY_TAMPERING` / `BACKDATED_PUSH` (medium, or high for a force push). Account-takeover campaigns such as PolinRider backdate loader commits this way. Signed commits, branch creation and pushes onto an empty ref are exempt. A bare force push in the last 90 days is reported as low, non-blocking information. If either call fails, the scan continues without these signals.
 
@@ -64,7 +106,7 @@ The package also ships standalone `scoreLinkedInProfile` and `scanPdfBytes` / `s
 
 ## GitHub API rate limits
 
-`scanGitHubRepo` and `scanGitHubUser` call the GitHub REST API directly. A single repo scan issues one tree request plus up to 200 file-content requests (most repos need far fewer). Unauthenticated, GitHub allows **60 requests/hour** — enough for scans of small repos. Pass a `githubToken` (a fine-grained or classic PAT, `public_repo`/`repo` scope) in the options to raise this to **5,000 requests/hour** and to scan private repositories:
+`scanGitHubRepo` and `scanGitHubUser` call the GitHub REST API directly. A single repo scan issues one tree request plus up to 200 file-content requests (most repos need far fewer) — or, with `tarball: true`, one tree request plus **one** archive request whatever the file count, which is what makes a scan viable without a token at all. Unauthenticated, GitHub allows **60 requests/hour** — enough for scans of small repos. Pass a `githubToken` (a fine-grained or classic PAT, `public_repo`/`repo` scope) in the options to raise this to **5,000 requests/hour** and to scan private repositories:
 
 ```ts
 await scanGitHubRepo(repo, { signatures, githubToken })
