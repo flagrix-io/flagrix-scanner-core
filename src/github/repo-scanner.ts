@@ -26,7 +26,7 @@ import {
   isRateLimitResponse
 } from "./api-error.js"
 import { fetchHistorySignals } from "./history-signals.js"
-import { matchOsvFeed, npmDependencies, pythonDependencies, type DeclaredDependency } from "./osv-feed.js"
+import { matchOsvFeed, npmDependencies, pythonDependencies, resolveNpmAlias, type DeclaredDependency } from "./osv-feed.js"
 import {
   calculateRawRiskScore,
   calculateRiskScore,
@@ -867,7 +867,16 @@ async function scanPackageJson(
 
   try {
     const pkg = JSON.parse(content)
-    const allDeps = { ...pkg.dependencies, ...pkg.devDependencies }
+    // Resolve `"alias": "npm:real-package@range"` to what npm installs before
+    // any name is checked. The alias key is a local name of the repo's own
+    // choosing, so matching it both reports packages the repo never installs
+    // and misses the ones it does — see resolveNpmAlias.
+    const allDeps = Object.fromEntries(
+      Object.entries({ ...pkg.dependencies, ...pkg.devDependencies }).map(([key, raw]) => {
+        const { name, spec } = resolveNpmAlias(key, typeof raw === "string" ? raw : "")
+        return [name, spec]
+      })
+    )
 
     // Typosquat candidates each need a download count from npm. Resolve them
     // together rather than one await per dependency: a manifest with several
@@ -944,6 +953,29 @@ function isAffectedPackageVersion(
   })
 }
 
+/**
+ * An install script that reaches the network. Substring tests were too blunt:
+ * `includes("http")` matched a docs URL in an echo, and `includes("fetch")`
+ * matched `prefetch` and `fetch-depth`.
+ */
+const NETWORK_IN_INSTALL_SCRIPT = /\b(?:curl|wget)\b|https?:\/\/|\bfetch\b/
+
+/**
+ * An install script that executes code it builds or downloads at run time.
+ *
+ * Rated critical, and `includes("exec")` was enough to reach it, so
+ * `npm exec`, `pnpm exec`, `yarn exec` and `nub exec --node fumadocs-mdx`
+ * all qualified — a package manager running a local binary is the ordinary
+ * shape of a postinstall. `includes("eval")` matched `evaluate`.
+ *
+ * What executes code built or fetched at run time: a shell `eval`, a runtime
+ * given inline code (`node -e`, `deno eval`), a `child_process` call, an
+ * `exec(` call rather than an `exec` subcommand, or a command substitution
+ * feeding a download into the shell.
+ */
+const DYNAMIC_EXECUTION_IN_INSTALL_SCRIPT =
+  /(?:^|[\s;&|(`])eval[\s"'`$(]|(?:^|[\s;&|(`])(?:node|nodejs|bun|deno)\s+(?:-e\b|--eval\b|-p\b|--print\b|eval\b)|child_process|\bexec(?:Sync|File|FileSync)?\s*\(|\$\(\s*(?:curl|wget)\b/
+
 function checkPostinstallScripts(content: string, filePath: string): GitHubFinding[] {
   const findings: GitHubFinding[] = []
 
@@ -955,12 +987,7 @@ function checkPostinstallScripts(content: string, filePath: string): GitHubFindi
     for (const scriptName of dangerousScripts) {
       const script = scripts[scriptName]
       if (script) {
-        if (
-          script.includes("curl") ||
-          script.includes("wget") ||
-          script.includes("http") ||
-          script.includes("fetch")
-        ) {
+        if (NETWORK_IN_INSTALL_SCRIPT.test(script)) {
           findings.push({
             severity: "high",
             type: "POSTINSTALL_SCRIPT",
@@ -968,7 +995,7 @@ function checkPostinstallScripts(content: string, filePath: string): GitHubFindi
             description: `${scriptName} script makes network requests: "${script.slice(0, 50)}..."`,
           })
         }
-        if (script.includes("eval") || script.includes("exec")) {
+        if (DYNAMIC_EXECUTION_IN_INSTALL_SCRIPT.test(script)) {
           findings.push({
             severity: "critical",
             type: "POSTINSTALL_SCRIPT",
@@ -1592,7 +1619,16 @@ function detectNetworkPatterns(
     // Valid public IPv4 only: each octet bounded 0–255, not embedded in a longer
     // dotted/number sequence (avoids flagging version strings like "1.2.3.4.5" or
     // impossible IPs like "999.999.999.999"), and excluding private/link-local ranges.
-    { pattern: /(?:https?:\/\/)?(?<![\d.])(?!(?:0\.|127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.))(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?![\d.])(?::\d{1,5})?/g, type: "Hardcoded IP Address", severity: "medium" as const, confidence: "low" as const },
+    //
+    // It must also be *addressed*, not merely present: introduced by a URL
+    // scheme or an opening quote, and closed by a quote, a path separator or a
+    // port. A dotted quad on its own is not a network signal, and source files
+    // are full of them — compressed SVG path data is the worst offender
+    // (`c2.91.83.1` in an icon component reads as 2.91.83.1), and so do
+    // version-like and coordinate sequences. What this signal is actually
+    // about is a hardcoded endpoint, and a hardcoded endpoint is a string:
+    // `fetch("http://185.x.x.x/x")`, `connect(4444, '185.x.x.x')`.
+    { pattern: /(?:https?:\/\/|["'`])(?<![\d.])(?!(?:0\.|127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.))(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?![\d.])(?::\d{1,5})?(?=["'`\/\s,;)\]}]|$)/g, type: "Hardcoded IP Address", severity: "medium" as const, confidence: "low" as const },
     { pattern: /https?:\/\/discord(?:app)?\.com\/api\/webhooks\/\d+\/[a-zA-Z0-9_-]+/gi, type: "Discord Webhook", severity: "critical" as const, ruleId: "NETWORK_DISCORD_WEBHOOK" },
     { pattern: /\d{8,10}:[a-zA-Z0-9_-]{35}/g, type: "Telegram Bot Token", severity: "high" as const, ruleId: "NETWORK_TELEGRAM_TOKEN" },
     { pattern: /(?:pastebin\.com|hastebin\.com|paste\.ee)\/[a-zA-Z0-9]+/gi, type: "Pastebin URL", severity: "medium" as const, ruleId: "NETWORK_PASTEBIN" },
@@ -1646,8 +1682,15 @@ function detectCryptoMining(
 
   const miningPatterns = [
     /coinhive|coin-hive|crypto-loot|cryptoloot|jsecoin/gi,
-    /stratum\+tcp|stratum\.|\bpool\./gi,
-    /monero|xmr|cryptonight/gi,
+    // A mining pool is a host, so require one: `pool.supportxmr.com`,
+    // `stratum+tcp://pool.minexmr.com:3333`. Bare `pool.` matched the English
+    // word: React describes its event pool as "returned to the pool." in a
+    // comment, and four of its reconciler files were reported as
+    // critical-severity crypto miners.
+    /stratum\+tcp|(?:stratum|pool)\.[a-z0-9-]{2,}\.[a-z]{2,}\b/gi,
+    // Word-bounded: `xmr` as a substring appears inside ordinary identifiers
+    // and encoded blobs.
+    /\bmonero\b|\bxmr\b|\bcryptonight\b/gi,
     /(?:miner|mining)[\w]*\.(?:start|run|init)/gi,
     /\.(?:setNumThreads|setThrottle|getHashesPerSecond)/gi,
   ]
@@ -1695,7 +1738,14 @@ function detectDataExfiltration(
   const exfiltrationPatterns = [
     { pattern: /navigator\.clipboard\.read(?:Text)?\s*\(/gi, type: "Clipboard Access", severity: "high" as const, ruleId: "EXFIL_CLIPBOARD" },
     { pattern: /document\.cookie/gi, type: "Cookie Access", severity: "high" as const, ruleId: "EXFIL_COOKIE" },
-    { pattern: /(?:input|password|email)[\w-]*\.value/gi, type: "Form Data Access", severity: "medium" as const, ruleId: null },
+    // Reading a password field is worth noting on its own. Reading an
+    // ordinary input is not: `input.value` and `emailInput.value` are how
+    // every form in every UI is written, so on its own it flagged React's own
+    // `ReactInputSelection.js`. What makes it exfiltration is the send, so
+    // that is what the generic form of this pattern now requires — the same
+    // shape as Form Data Transmission below.
+    { pattern: /password[\w-]*\.value/gi, type: "Password Field Access", severity: "medium" as const, ruleId: null },
+    { pattern: /(?:input|email)[\w-]*\.value[\s\S]{0,200}?(?:fetch\s*\(|axios|XMLHttpRequest|sendBeacon|new\s+WebSocket)/gi, type: "Form Data Access", severity: "medium" as const, ruleId: null },
     { pattern: /new\s+FormData\s*\([^)]*\)[\s\S]{0,100}(?:fetch|axios|XMLHttpRequest)/gi, type: "Form Data Transmission", severity: "medium" as const, ruleId: null },
   ].filter(({ ruleId }) => !ruleId || !coveredRuleIds.has(ruleId))
 
@@ -1896,8 +1946,14 @@ function detectSuspiciousFileAccess(
   // Deleting a known temp directory or an application-owned cache is routine
   // cleanup. Only report destructive deletion when the target is a broad or
   // sensitive user/system path.
+  //
+  // What makes a deletion dangerous is where it is rooted, not whether it
+  // globs. The previous `[^\n]*[?*]` alternative flagged any `rm -rf`
+  // containing a wildcard, down to a build script clearing its own output
+  // directory (`rm -rf "$main_dir"/fp*`). The target now has to start at the
+  // filesystem root, the home directory, or a bare glob in the current one.
   const destructiveDeletion =
-    /(?:rm\s+-rf\s+(?:["']?(?:\/|~|\$HOME)(?!\/?(?:tmp|var\/tmp)\b)|[^\n]*[?*])|(?:fs\.)?(?:unlink|unlinkSync|rmSync)\s*\([^\n)]*(?:\.ssh|\.aws|\.gnupg|\.docker|\/etc|\/usr|\/home|Users[\\/]))/gi
+    /(?:rm\s+-rf\s+["']?(?:(?:\/|~|\$\{?HOME\}?)(?!\/?(?:tmp|var\/tmp)\b)|\*)|(?:fs\.)?(?:unlink|unlinkSync|rmSync)\s*\([^\n)]*(?:\.ssh|\.aws|\.gnupg|\.docker|\/etc|\/usr|\/home|Users[\\/]))/gi
   if (destructiveDeletion.test(content)) {
     findings.push({
       severity: "medium",
@@ -2059,7 +2115,12 @@ function checkTyposquat(packageName: string): string | null {
   for (const popular of popularPackages) {
     if (packageName === popular) continue
     if (Math.abs(packageName.length - popular.length) > 3) continue
-    if (levenshteinDistance(packageName, popular) <= 2) return popular
+    // Two edits only mean "typo" on a name long enough to still be
+    // recognisable after them. On a short name the distance stops carrying
+    // signal and starts linking unrelated packages: `jsr` — Deno's registry
+    // client — is two edits from `jest`, which made zod a typosquat host.
+    const limit = Math.min(packageName.length, popular.length) >= 5 ? 2 : 1
+    if (levenshteinDistance(packageName, popular) <= limit) return popular
   }
 
   return null

@@ -91,7 +91,24 @@ function declaredMatch(spec: string, affected: readonly string[]): "exact" | "ra
   let result: "exact" | "range" | null = null
   for (const part of specifier.split(/\s*\|\|\s*/)) {
     const base = part.match(VERSION_TOKEN)?.[0]
-    if (!base || !affected.some((entry) => inAffected(base, entry))) continue
+    if (!base) continue
+    // Taking the part's first version token as the version it resolves to
+    // holds for `1.2.3` and `^1.2.3`, but not for a bound the operator
+    // excludes: `>11.1.6` is every version after 11.1.6, so reading it as
+    // 11.1.6 reports the one version the range rules out. OSV lists
+    // file-entry-cache 11.1.6 as malicious and eslint declares
+    // `11.1.5 || >11.1.6 <12`, which excludes it.
+    //
+    // When both sides are precise — a declared range against an exact
+    // affected version — test whether the range admits that version instead.
+    // `inAffected` reads the operators out of its second argument, so the
+    // declared part goes there. An affected entry that is itself a range
+    // keeps the point test.
+    const declaredRange = /[<>]/.test(part)
+    const hit = affected.some((entry) =>
+      declaredRange && !/[<>]/.test(entry) ? inAffected(entry, part) : inAffected(base, entry)
+    )
+    if (!hit) continue
     if (/^\s*(?:={1,3}|v)?\s*\d/.test(part) && !/[\s,]/.test(part.trim().replace(/^={1,3}\s*/, ""))) return "exact"
     result = "range"
   }
@@ -144,14 +161,43 @@ export function matchOsvFeed(
   return findings
 }
 
+/**
+ * What a dependency entry actually installs.
+ *
+ * npm lets the key be an alias and the specifier name the real package:
+ * `"eslint-plugin-react-hooks-published": "npm:eslint-plugin-react-hooks@^5.2.0"`
+ * installs `eslint-plugin-react-hooks` under a local name. The key is a name
+ * of the repo's own choosing that npm never resolves from the registry, so
+ * the aliased target is what has to be checked.
+ *
+ * Matching the key reports packages a repo does not install: facebook/react
+ * declares both of the aliases above, and malicious packages have since been
+ * published on npm under those alias names. It also misses the ones a repo
+ * does install — `"lodash": "npm:evil@1.0.0"` installs `evil`.
+ *
+ * `patch:`, `portal:`, `file:` and the other in-repo specifiers are handled by
+ * LOCAL_OR_URL_SPEC instead: those resolve inside the repo, not to a name.
+ */
+export function resolveNpmAlias(name: string, spec: string): { name: string; spec: string } {
+  const target = spec.trim().match(/^npm:(.+)$/)?.[1]
+  if (!target) return { name, spec }
+  // A scoped name starts with `@`, so the separator is the LAST `@`:
+  // `@scope/pkg@1.0.0` → `@scope/pkg` and `1.0.0`, while a bare `@scope/pkg`
+  // names no version and installs whatever `*` resolves to.
+  const at = target.lastIndexOf("@")
+  if (at <= 0) return { name: target, spec: "*" }
+  return { name: target.slice(0, at), spec: target.slice(at + 1) }
+}
+
 /** Dependencies a package.json declares (all dependency sections). */
 export function npmDependencies(pkg: Record<string, unknown>, file: string): DeclaredDependency[] {
   const out: DeclaredDependency[] = []
   for (const section of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
     const deps = pkg[section]
     if (!deps || typeof deps !== "object") continue
-    for (const [name, spec] of Object.entries(deps as Record<string, unknown>)) {
-      out.push({ ecosystem: "npm", name, spec: typeof spec === "string" ? spec : "", file })
+    for (const [key, raw] of Object.entries(deps as Record<string, unknown>)) {
+      const { name, spec } = resolveNpmAlias(key, typeof raw === "string" ? raw : "")
+      out.push({ ecosystem: "npm", name, spec, file })
     }
   }
   return out

