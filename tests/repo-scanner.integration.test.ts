@@ -1691,18 +1691,39 @@ describe("reading the repo as one tarball", () => {
     })
 
     it("scans per file when the response streams past the download cap", async () => {
+      // A valid archive whose only fault is its size, so the cap is the only
+      // reason to fall back. A body that is not gzip gives the reader two
+      // reasons, and which one it reports depends on whether the byte counter
+      // trips before the decompressor rejects the header — an order Node
+      // 24.22.3 reversed. One entry larger than the cap keeps the parse
+      // mid-file when the counter trips, where plain zeroes would read as
+      // tar's end-of-archive marker and end it at byte 1024; level 0 stores
+      // rather than deflates, so the zeroed body costs almost nothing.
+      const bytes = new Uint8Array(
+        gzipSync(
+          Buffer.concat([
+            tarEntry(
+              `${ROOT}/big.bin`,
+              Buffer.alloc(MAX_TARBALL_COMPRESSED_BYTES + 2 * 1024 * 1024)
+            ),
+            Buffer.alloc(1024),
+          ]),
+          { level: 0 }
+        )
+      )
       let sent = 0
       const { result } = await scanVia(twoFiles, {
         tarballResponse: () =>
           new Response(
             new ReadableStream<Uint8Array>({
               pull(controller) {
-                if (sent > MAX_TARBALL_COMPRESSED_BYTES + 4 * 1024 * 1024) {
+                if (sent >= bytes.byteLength) {
                   controller.close()
                   return
                 }
-                sent += 4 * 1024 * 1024
-                controller.enqueue(new Uint8Array(4 * 1024 * 1024))
+                const end = Math.min(sent + 4 * 1024 * 1024, bytes.byteLength)
+                controller.enqueue(bytes.subarray(sent, end))
+                sent = end
               },
             }),
             { status: 200 }

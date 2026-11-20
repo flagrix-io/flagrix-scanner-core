@@ -58,6 +58,57 @@ function tarball(
   return gzipSync(Buffer.concat(entries))
 }
 
+/**
+ * A body that is a valid gzip stream and wrong in exactly one way: too big.
+ *
+ * Zero-filled chunks are the cheap way to make a large body, but they are not
+ * gzip, so such a response is over the cap *and* unreadable — and which
+ * reason comes back depends on whether the counter trips before the
+ * decompressor rejects the header. That ordering is not the reader's to
+ * control: Node 24.22.3 reversed it. Level 0 stores rather than deflates, so
+ * zeroed input buys a valid single-member gzip stream of the same size.
+ */
+let oversizedGzipCache: Uint8Array | null = null
+function oversizedGzip(): Uint8Array {
+  if (!oversizedGzipCache) {
+    // One entry larger than the cap, so the parse is still mid-file when the
+    // counter trips. A body of plain zeroes would not do: two zero blocks are
+    // tar's end-of-archive marker, so the parse would finish at byte 1024
+    // having found nothing, long before the cap came into it.
+    const archive = Buffer.concat([
+      tarEntry(`${ROOT}/big.bin`, Buffer.alloc(MAX_TARBALL_COMPRESSED_BYTES + 2 * 1024 * 1024)),
+      Buffer.alloc(1024),
+    ])
+    oversizedGzipCache = new Uint8Array(gzipSync(archive, { level: 0 }))
+  }
+  return oversizedGzipCache
+}
+
+/** Serves `bytes` in 1MB chunks, reporting how far the consumer actually got. */
+function streamInChunks(bytes: Uint8Array): {
+  body: ReadableStream<Uint8Array>
+  sent: () => number
+  cancelled: () => boolean
+} {
+  let sent = 0
+  let cancelled = false
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent >= bytes.byteLength) {
+        controller.close()
+        return
+      }
+      const end = Math.min(sent + 1024 * 1024, bytes.byteLength)
+      controller.enqueue(bytes.subarray(sent, end))
+      sent = end
+    },
+    cancel() {
+      cancelled = true
+    },
+  })
+  return { body, sent: () => sent, cancelled: () => cancelled }
+}
+
 function serve(body: Buffer | string, init: ResponseInit = {}): typeof fetch {
   return vi.fn(async () => new Response(body, { status: 200, ...init })) as unknown as typeof fetch
 }
@@ -259,22 +310,7 @@ describe("readRepoTarball", () => {
     it("reports too-large when a response with no length streams past the cap", async () => {
       // tensorflow's archive is chunked and carries no content-length, so the
       // cap has to hold while the bytes arrive — and stop them arriving.
-      let sent = 0
-      let cancelled = false
-      const chunk = new Uint8Array(1024 * 1024)
-      const body = new ReadableStream<Uint8Array>({
-        pull(controller) {
-          if (sent > MAX_TARBALL_COMPRESSED_BYTES * 2) {
-            controller.close()
-            return
-          }
-          sent += chunk.byteLength
-          controller.enqueue(chunk)
-        },
-        cancel() {
-          cancelled = true
-        },
-      })
+      const { body, sent, cancelled } = streamInChunks(oversizedGzip())
       const result = await readRepoTarball(
         "acme",
         "sample",
@@ -285,9 +321,9 @@ describe("readRepoTarball", () => {
       )
 
       expect(result).toEqual({ ok: false, reason: "too-large" })
-      expect(cancelled).toBe(true)
+      expect(cancelled()).toBe(true)
       // It stopped at the cap instead of reading the whole response.
-      expect(sent).toBeLessThanOrEqual(MAX_TARBALL_COMPRESSED_BYTES + chunk.byteLength * 2)
+      expect(sent()).toBeLessThanOrEqual(MAX_TARBALL_COMPRESSED_BYTES + 2 * 1024 * 1024)
     })
 
     it("reports unreadable when the body is not gzip", async () => {
