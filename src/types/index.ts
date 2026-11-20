@@ -158,6 +158,23 @@ export interface GitHubScanResult extends RiskAssessment {
     /** GitHub returned a partial tree (repo too large for one tree call). */
     treeTruncated: boolean
     /**
+     * How the repo's contents were read, which decides how much of it was
+     * read. `"tarball"` is one request for the whole commit, so the budget is
+     * a byte cap and coverage runs to thousands of files; `"per-file"` is one
+     * request per file, so the budget is 200 files whatever the repo's size.
+     *
+     * Consumers must surface this. Two people can get different scores for
+     * the same commit depending on which reader ran — the extension's tarball
+     * read is behind an optional host permission — and for a security tool a
+     * verdict that varies silently is worse than one that is slow.
+     */
+    readMode: "tarball" | "per-file"
+    /**
+     * Why the tarball read was not used, when the caller asked for one.
+     * Absent on a `"tarball"` read and when the caller never asked.
+     */
+    readFallbackReason?: "too-large" | "unavailable" | "unreadable"
+    /**
      * Whether every file the scan selected was actually read. False means the
      * verdict rests on partial evidence — unread files cannot clear a repo, so
      * a "no findings" result is only as strong as its coverage. Consumers must
@@ -355,6 +372,20 @@ export interface RepoScanOptions {
    * dependencies; omit to check only the curated list in `signatures`.
    */
   osvFeed?: OsvMaliciousFeed
+  /**
+   * Read the whole commit in one request (`/tarball/{sha}`) instead of one
+   * request per file. It is faster and reads far more of the repo — react
+   * goes from 226 files in 16.5s to 4,565 in 6.7s — and it costs one
+   * rate-limit unit instead of hundreds, which is what makes a scan without a
+   * token viable at all against the anonymous 60-requests-an-hour limit.
+   *
+   * Off by default, because asking is not free: the endpoint redirects to
+   * codeload.github.com, so a browser extension needs that origin granted,
+   * and a request made without it costs a round trip before it fails. Turn it
+   * on wherever that host is reachable. Every failure falls back to the
+   * per-file path, and `scanSummary.readMode` reports which one ran.
+   */
+  tarball?: boolean
 }
 
 /** Packages malicious in every version (`all`) or in the listed `versions`. */

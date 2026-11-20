@@ -43,6 +43,8 @@ export { scanGitHubRepo } from "./github/repo-scanner.js"
 export { detectHistoryTampering } from "./github/history-signals.js"
 export { matchOsvFeed, normalizePypiName } from "./github/osv-feed.js"
 export { scanGitHubUser } from "./github/user-scanner.js"
+export { readRepoTarball } from "./github/tarball.js"
+export type { TarballRead, TarballFallbackReason } from "./github/tarball.js"
 export { DEFAULT_USER_PROFILE_RULES } from "./github/user-profile-ruleset.js"
 
 // LinkedIn scorer

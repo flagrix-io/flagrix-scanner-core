@@ -26,6 +26,11 @@ import {
   isRateLimitResponse
 } from "./api-error.js"
 import { fetchHistorySignals } from "./history-signals.js"
+import {
+  MAX_TARBALL_TREE_BYTES,
+  readRepoTarball,
+  type TarballFallbackReason,
+} from "./tarball.js"
 import { matchOsvFeed, npmDependencies, pythonDependencies, resolveNpmAlias, type DeclaredDependency } from "./osv-feed.js"
 import {
   calculateRawRiskScore,
@@ -164,6 +169,21 @@ function decodeUtf8(binary: string): string {
   const bytes = new Uint8Array(binary.length)
   for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index)
   return UTF8.decode(bytes)
+}
+
+/**
+ * One character per byte, the same string `atob` yields — which is what the
+ * font magic-number check reads. `TextDecoder("latin1")` cannot stand in for
+ * this: the Encoding spec maps that label to windows-1252, which rewrites
+ * 0x80–0x9F and so would corrupt the very bytes being identified.
+ */
+function latin1(bytes: Uint8Array): string {
+  const CHUNK = 8192
+  let out = ""
+  for (let start = 0; start < bytes.length; start += CHUNK) {
+    out += String.fromCharCode(...bytes.subarray(start, start + CHUNK))
+  }
+  return out
 }
 
 export function isConfigFile(path: string): boolean {
@@ -315,6 +335,31 @@ function sourcePriority(path: string): number {
   if (RUNS_ON_INSTALL_OR_BUILD.test(path)) return 0
   return 1
 }
+
+/**
+ * Source budget when the whole repo arrives in one request.
+ *
+ * `MAX_FILES_TO_SCAN` is a request budget: a file costs a round trip, so the
+ * only way to bound a scan was to bound the file count. Reading the tarball
+ * costs one request whatever the count, which leaves bytes as the thing worth
+ * bounding — pattern matching is linear in bytes and indifferent to how many
+ * files they are spread across.
+ *
+ * What bounds it is memory rather than time. Each source file's masked copy
+ * is retained for the whole scan and the detectors then run global regexes
+ * over all of it, so peak heap runs roughly 13-14x the source read. Measured
+ * on facebook/react (4,565 eligible source files, 22.7MB): a 4MB cap peaks at
+ * 30MB of heap, 8MB at 49MB, 16MB at 217MB, 32MB at 427MB, and a 32MB cap
+ * cannot complete the scan in a 256MB heap. The extension runs this in an MV3
+ * service worker.
+ *
+ * 16MB reads 4,373 of react's 4,565 source files, 96% of them against the 226
+ * the file cap allowed, in 11.5s within a 384MB heap, and 3,078 of
+ * prisma/prisma's 8,226 at a 107MB peak. Doubling it buys the last 4% of
+ * react for twice the memory, and the files it adds are the deprioritised
+ * tail: tests, fixtures and vendored artifacts the rules skip anyway.
+ */
+const MAX_SOURCE_BYTES = 16 * 1024 * 1024
 // Blobs above this are skipped ("too-large"): almost always bundles or
 // vendored artifacts, and fetching them dominates scan time on big repos.
 const MAX_FILE_SIZE_BYTES = 1024 * 1024
@@ -477,9 +522,6 @@ export async function scanGitHubRepo(
       }
     }
     sortByPriority(sourceBlobs, sourcePriority)
-    for (const item of sourceBlobs.splice(MAX_FILES_TO_SCAN)) {
-      skip(item.path, "over-file-limit")
-    }
     // Spend the config budget on the configs a tool executes before the ones
     // it merely reads (configPriority), so widening the set never costs
     // coverage of the auto-run files. Tree order is kept inside each tier.
@@ -488,7 +530,68 @@ export async function scanGitHubRepo(
     for (const item of configFiles.splice(MAX_CONFIG_FILES)) {
       skip(item.path, "over-file-limit")
     }
-    const filesToScan = [...configFiles, ...fontFiles, ...sourceBlobs]
+
+    /**
+     * Which sources fit the budget. The budget itself depends on how the
+     * contents will be read, so this runs once per candidate reader: under a
+     * byte cap when the whole repo comes in one request, and under the file
+     * cap when each file costs its own. Nothing is recorded here — the caller
+     * skips the leftovers only for the reader it ends up using, so an
+     * abandoned tarball attempt leaves no trace in the summary.
+     */
+    const selectSources = (byteCapped: boolean) => {
+      if (!byteCapped) {
+        return { kept: sourceBlobs.slice(0, MAX_FILES_TO_SCAN), overLimit: sourceBlobs.slice(MAX_FILES_TO_SCAN) }
+      }
+      let bytes = 0
+      let cut = sourceBlobs.length
+      for (let index = 0; index < sourceBlobs.length; index++) {
+        bytes += sourceBlobs[index]!.size ?? 0
+        if (bytes > MAX_SOURCE_BYTES) {
+          cut = index
+          break
+        }
+      }
+      return { kept: sourceBlobs.slice(0, cut), overLimit: sourceBlobs.slice(cut) }
+    }
+
+    // Reading the repo as one tarball is opt-in: in the extension it needs an
+    // optional host permission for codeload.github.com, and asking without
+    // one costs a round trip before it fails. The caller decides; this only
+    // tries, and records how it went so the verdict can say which coverage it
+    // rests on.
+    let readMode: "tarball" | "per-file" = "per-file"
+    let readFallbackReason: TarballFallbackReason | undefined
+    let tarballFiles: Map<string, Uint8Array> | null = null
+    let selected = selectSources(false)
+
+    if (options.tarball) {
+      const treeBytes = tree.tree.reduce(
+        (total, item) => total + (item.type === "blob" ? item.size ?? 0 : 0),
+        0
+      )
+      if (treeBytes > MAX_TARBALL_TREE_BYTES) {
+        readFallbackReason = "too-large"
+      } else {
+        const candidate = selectSources(true)
+        const wanted = new Set(
+          [...configFiles, ...fontFiles, ...candidate.kept].map((item) => item.path)
+        )
+        const read = await readRepoTarball(repo.owner, repo.repo, commitSha, wanted, headers)
+        if (read.ok) {
+          readMode = "tarball"
+          tarballFiles = read.files
+          selected = candidate
+        } else {
+          readFallbackReason = read.reason
+        }
+      }
+    }
+
+    for (const item of selected.overLimit) {
+      skip(item.path, "over-file-limit")
+    }
+    const filesToScan = [...configFiles, ...fontFiles, ...selected.kept]
     // Command targets discovered while reading configs join the queue later;
     // every blob is either queued or skipped, so a target is moved out of
     // the skipped list when it is queued.
@@ -563,6 +666,23 @@ export async function scanGitHubRepo(
       | { state: "rate-limited" }
       | { state: "failed" }
     const readFile = async (file: GitHubTreeItem): Promise<FileRead> => {
+      // Already in hand from the tarball: no request, and the bytes are raw
+      // rather than base64 round-tripped through atob.
+      const fromTarball = tarballFiles?.get(file.path)
+      if (fromTarball) {
+        return {
+          state: "read",
+          content: isFontFile(file.path)
+            ? latin1(fromTarball)
+            : UTF8.decode(fromTarball),
+        }
+      }
+      // A queued file the tarball did not carry falls through to a request.
+      // That is how command targets discovered later get read (they were not
+      // in the wanted set), and it covers the entries `git archive` writes
+      // without content, such as symlinks — whose target text the contents
+      // API returns, exactly as it did before.
+
       // Once GitHub refuses on budget every later request would be refused
       // too, so queued reads that have not started are abandoned. Reads
       // already in flight are allowed to land: they cost nothing extra and
@@ -840,6 +960,8 @@ export async function scanGitHubRepo(
         skippedFiles,
         skippedCount,
         treeTruncated: tree.truncated,
+        readMode,
+        ...(readFallbackReason ? { readFallbackReason } : {}),
         complete: !rateLimited && fetchFailures === 0,
         ...(rateLimited
           ? { incompleteReason: "rate-limit" as const }
