@@ -786,9 +786,19 @@ export async function scanGitHubRepo(
         patternsMatched += pkgFindings.length
         dependenciesChecked += countDependencies(content)
 
-        const postinstallFindings = checkPostinstallScripts(content, file.path)
-        findings.push(...postinstallFindings)
-        patternsMatched += postinstallFindings.length
+        // A manifest under a test fixture declares lifecycle scripts because
+        // that is what it is for: pnpm and npm both keep packages like
+        // `test/fixtures/with-many-scripts/package.json` to exercise their
+        // own installer. Reading those as a supply-chain attack scored
+        // pnpm/pnpm 1.000 and npm/cli 0.617 on the reference corpus. The
+        // data-driven rules already skip test paths; this built-in did not.
+        // Dependency checks above stay on — a fixture pinning a known
+        // malicious package is still worth saying.
+        if (!isTestFile(file.path)) {
+          const postinstallFindings = checkPostinstallScripts(content, file.path)
+          findings.push(...postinstallFindings)
+          patternsMatched += postinstallFindings.length
+        }
       }
 
       if (isFontFile(file.path)) {
@@ -1095,6 +1105,15 @@ const NETWORK_IN_INSTALL_SCRIPT = /\b(?:curl|wget)\b|https?:\/\/|\bfetch\b/
  * `exec(` call rather than an `exec` subcommand, or a command substitution
  * feeding a download into the shell.
  */
+/**
+ * `node -e 'process.exit(0)'` as a lifecycle script is a deliberate no-op —
+ * electron uses one to stop `npm install` doing anything — and it executes
+ * nothing. Matching it on `node -e` alone made electron's root manifest a
+ * critical finding.
+ */
+const INERT_INLINE_SCRIPT =
+  /^(?:node|nodejs|bun|deno)\s+(?:-e|--eval)\s+(['"])\s*process\.exit\(\s*\d*\s*\)\s*;?\s*\1$/
+
 const DYNAMIC_EXECUTION_IN_INSTALL_SCRIPT =
   /(?:^|[\s;&|(`])eval[\s"'`$(]|(?:^|[\s;&|(`])(?:node|nodejs|bun|deno)\s+(?:-e\b|--eval\b|-p\b|--print\b|eval\b)|child_process|\bexec(?:Sync|File|FileSync)?\s*\(|\$\(\s*(?:curl|wget)\b/
 
@@ -1117,7 +1136,10 @@ function checkPostinstallScripts(content: string, filePath: string): GitHubFindi
             description: `${scriptName} script makes network requests: "${script.slice(0, 50)}..."`,
           })
         }
-        if (DYNAMIC_EXECUTION_IN_INSTALL_SCRIPT.test(script)) {
+        if (
+          DYNAMIC_EXECUTION_IN_INSTALL_SCRIPT.test(script) &&
+          !INERT_INLINE_SCRIPT.test(script.trim())
+        ) {
           findings.push({
             severity: "critical",
             type: "POSTINSTALL_SCRIPT",
