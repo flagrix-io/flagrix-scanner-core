@@ -11,6 +11,22 @@
  * never executes anything.
  */
 
+/**
+ * What masked content is replaced with, one character per character so line
+ * and column positions survive.
+ *
+ * Not a space. Masking with spaces manufactures the very artifact some rules
+ * hunt for: a 7,978-character Unicode character class in next.js's bundled
+ * `comment-json` became a 7,978-space run, which read as code pushed
+ * off-screen by whitespace padding and scored high. Any file with a long
+ * regex literal — a parser, a tokenizer, a validator — could do the same.
+ *
+ * `~` is not whitespace, not a base64 or hex character, and not valid in an
+ * identifier, so a run of it cannot look like padding, an encoded payload or
+ * a name.
+ */
+const MASK_FILL = "~"
+
 const REGEX_ALLOWED_AFTER_CHAR = new Set([..."=(:,[!&|?{};+*%^<>~"])
 const REGEX_ALLOWED_AFTER_WORD = new Set(["return", "case", "typeof", "in", "of", "do", "void", "delete"])
 
@@ -41,7 +57,7 @@ function maskLine(line: string): string {
     if (ch === "/" && regexCanStartAfter(out)) {
       const end = regexEnd(line, i)
       if (end !== -1) {
-        out += " ".repeat(end - i)
+        out += MASK_FILL.repeat(end - i)
         i = end
         continue
       }
@@ -124,7 +140,7 @@ export function maskStringLiterals(content: string): string {
 
     if (quote) {
       if (ch === "\\") {
-        out += "  " // mask escape pairs, length preserved
+        out += MASK_FILL.repeat(2) // escape pairs, length preserved
         i += 2
         continue
       }
@@ -132,7 +148,7 @@ export function maskStringLiterals(content: string): string {
         quote = null
         out += ch
       } else {
-        out += ch === "\n" ? "\n" : " "
+        out += ch === "\n" ? "\n" : MASK_FILL
       }
       i++
       continue
