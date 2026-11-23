@@ -88,3 +88,29 @@ describe("maskStringLiterals (test-file fixtures)", () => {
     expect(masked.split("\n")).toHaveLength(2)
   })
 })
+
+describe("masking does not manufacture whitespace padding", () => {
+  // A 7,978-character Unicode character class in next.js's bundled
+  // `comment-json` was masked to a 7,978-space run, which read as code
+  // pushed off-screen by padding and scored high on a clean repo. Any long
+  // regex literal — a parser, a tokenizer, a validator — could do the same.
+  const longClass = `const ID = /[${"\\u00AA\\u00B5".repeat(400)}]/\nrequire("fs")\n`
+
+  it("leaves no run of spaces where a regex literal was", () => {
+    const masked = maskRegexLiterals(longClass)
+    expect(masked).not.toMatch(/ {300,}/)
+    expect(masked.length).toBe(longClass.length)
+  })
+
+  it("keeps line positions", () => {
+    const masked = maskRegexLiterals(longClass)
+    expect(masked.split("\n").length).toBe(longClass.split("\n").length)
+    expect(masked).toContain(`require("fs")`)
+  })
+
+  it("still hides what the regex said", () => {
+    const masked = maskRegexLiterals(`const re = /child_process/\n`)
+    expect(masked).not.toContain("child_process")
+    expect(masked.length).toBe(`const re = /child_process/\n`.length)
+  })
+})
