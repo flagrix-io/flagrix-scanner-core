@@ -600,6 +600,8 @@ export async function scanGitHubRepo(
     )
     const queued = new Set(filesToScan.map((item) => item.path))
     const commandTargets = new Set<string>()
+    const installHooks: InstallHook[] = []
+    const installHookFiles = new Set<string>()
     const unskip = (path: string) => {
       const index = skippedFiles.findIndex((skipped) => skipped.path === path)
       if (index !== -1) skippedFiles.splice(index, 1)
@@ -798,6 +800,7 @@ export async function scanGitHubRepo(
           const postinstallFindings = checkPostinstallScripts(content, file.path)
           findings.push(...postinstallFindings)
           patternsMatched += postinstallFindings.length
+          installHooks.push(...readInstallHooks(content, file.path))
         }
       }
 
@@ -854,14 +857,48 @@ export async function scanGitHubRepo(
     // bounds it). Sequencing reads this way keeps the file order — and so
     // every counter, finding and skip reason — identical to reading one by
     // one, while spending a fraction of the wall time.
-    for (let cursor = 0; cursor < filesToScan.length; ) {
-      const generation = filesToScan.slice(cursor)
-      cursor = filesToScan.length
-      const reads = await mapPool(generation, FETCH_CONCURRENCY, readFile)
-      for (let index = 0; index < generation.length; index++) {
-        await analyzeFile(generation[index]!, reads[index]!)
+    let cursor = 0
+    const drainQueue = async () => {
+      while (cursor < filesToScan.length) {
+        const generation = filesToScan.slice(cursor)
+        cursor = filesToScan.length
+        const reads = await mapPool(generation, FETCH_CONCURRENCY, readFile)
+        for (let index = 0; index < generation.length; index++) {
+          await analyzeFile(generation[index]!, reads[index]!)
+        }
       }
     }
+    await drainQueue()
+
+    // Install hooks are scored by what the script they run can do, so read
+    // that script and the local modules it imports. A hook target may have
+    // been analyzed before its manifest named it, so the closure is worked
+    // out here, once everything queued so far has been read.
+    const scannedContent = new Map(fileContents.map((file) => [file.path, file.content]))
+    for (let depth = 0; depth < MAX_INSTALL_HOOK_IMPORT_DEPTH && installHooks.length > 0; depth++) {
+      let queuedMore = false
+      for (const path of installHookClosure(installHooks, scannedContent)) {
+        if (scannedContent.has(path) || queued.has(path)) continue
+        if (installHookFiles.size >= MAX_INSTALL_HOOK_FILES) break
+        const item = blobsByPath.get(path)
+        if (!item || (item.size !== undefined && item.size > MAX_FILE_SIZE_BYTES)) continue
+        installHookFiles.add(path)
+        unskip(path)
+        queued.add(path)
+        commandTargets.add(path)
+        filesToScan.push(item)
+        queuedMore = true
+      }
+      if (!queuedMore) break
+      await drainQueue()
+      for (const file of fileContents) scannedContent.set(file.path, file.content)
+    }
+    applyInstallHookCapabilities(
+      findings,
+      installHooks,
+      scannedContent,
+      (path) => blobsByPath.has(path) || tree.truncated
+    )
 
     if (options.osvFeed) {
       const alreadyFlagged = new Set(
@@ -1116,6 +1153,172 @@ const INERT_INLINE_SCRIPT =
 
 const DYNAMIC_EXECUTION_IN_INSTALL_SCRIPT =
   /(?:^|[\s;&|(`])eval[\s"'`$(]|(?:^|[\s;&|(`])(?:node|nodejs|bun|deno)\s+(?:-e\b|--eval\b|-p\b|--print\b|eval\b)|child_process|\bexec(?:Sync|File|FileSync)?\s*\(|\$\(\s*(?:curl|wget)\b/
+
+// ─── Install hooks scored by capability ───────────────────────────────────────
+
+/**
+ * An npm lifecycle script that runs on `npm install`. Having one is not a
+ * finding: native addons, platform-binary launchers and build steps all use
+ * them. What a hook can do is the finding.
+ */
+export interface InstallHook {
+  manifest: string
+  hook: string
+  command: string
+  /** Repo paths the command runs with node/bun/deno/tsx. */
+  targets: string[]
+}
+
+const INSTALL_HOOK_NAMES = ["preinstall", "install", "postinstall"] as const
+const MAX_INSTALL_HOOK_FILES = 20
+const MAX_INSTALL_HOOK_IMPORT_DEPTH = 3
+
+/**
+ * Rules that recognise an install hook by its shape alone — a campaign's
+ * `preinstall: node setup.mjs` — rather than by anything the hook does. The
+ * shape is right, and pnpm's own `@pnpm/exe` has it: `preinstall: node
+ * setup.js`, which links the platform binary into place. So these findings
+ * are rated by what the script they run can do (see
+ * `applyInstallHookCapabilities`).
+ */
+const INSTALL_HOOK_SHAPE_RULES = new Set(["SUPPLY_CHAIN_PREINSTALL_SETUP_DROPPER"])
+
+export function readInstallHooks(content: string, manifest: string): InstallHook[] {
+  let scripts: Record<string, unknown>
+  try {
+    scripts = (JSON.parse(content) as { scripts?: Record<string, unknown> }).scripts ?? {}
+  } catch {
+    return []
+  }
+  const hooks: InstallHook[] = []
+  for (const hook of INSTALL_HOOK_NAMES) {
+    const command = scripts[hook]
+    if (typeof command !== "string" || command.trim() === "") continue
+    hooks.push({ manifest, hook, command, targets: extractCommandTargets(command, manifest) })
+  }
+  return hooks
+}
+
+const LOCAL_IMPORT =
+  /(?:\bimport\s+(?:[\w*{}\s,$]+\s+from\s+)?|\bimport\s*\(\s*|\brequire\s*\(\s*)['"](\.{1,2}\/[^'"]+)['"]/g
+const IMPORT_EXTENSIONS = ["", ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", "/index.js", "/index.mjs", "/index.ts"]
+
+/** Hook targets plus every local module they import, as far as has been read. */
+export function installHookClosure(
+  hooks: readonly InstallHook[],
+  contents: ReadonlyMap<string, string>
+): string[] {
+  const seen = new Set<string>()
+  const pending = hooks.flatMap((hook) => hook.targets)
+  while (pending.length > 0 && seen.size < MAX_INSTALL_HOOK_FILES * 4) {
+    const path = pending.shift()!
+    if (seen.has(path)) continue
+    seen.add(path)
+    const content = contents.get(path)
+    if (content === undefined) continue
+    const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : ""
+    for (const match of content.matchAll(LOCAL_IMPORT)) {
+      const base = resolveRepoPath(dir, match[1]!)
+      if (!base) continue
+      const resolved =
+        IMPORT_EXTENSIONS.map((ext) => base + ext).find((candidate) => contents.has(candidate)) ??
+        (/\.[cm]?[jt]s$/.test(base) ? base : `${base}.js`)
+      pending.push(resolved)
+    }
+  }
+  return [...seen]
+}
+
+/**
+ * What an install-time script can do that makes running it on `npm install`
+ * dangerous. Running local build steps, linking a binary, or writing inside
+ * the package is none of these.
+ */
+const INSTALL_CAPABILITIES: Array<{ label: string; test: (text: string) => boolean }> = [
+  {
+    label: "downloads and executes code",
+    test: (text) =>
+      /\bfetch\s*\(|\bhttps?\.(?:get|request)\s*\(|require\s*\(\s*['"](?:node:)?https?['"]\s*\)|from\s+['"](?:node:)?https?['"]|\baxios\b|\bgot\s*\(|\bundici\b|XMLHttpRequest|\bcurl\b|\bwget\b|Invoke-WebRequest|\biwr\b|new\s+WebSocket\b/i.test(text) &&
+      /\bchild_process\b|\b(?:exec|execSync|execFile|execFileSync|spawn|spawnSync|fork)\s*\(|\beval\s*\(|new\s+Function\b|\bvm\.(?:run\w*|Script)\b|\bBun\.spawn|\|\s*(?:ba|z)?sh\b/i.test(text),
+  },
+  {
+    label: "writes outside the project",
+    test: (text) =>
+      /\b(?:writeFile\w*|appendFile\w*|copyFile\w*|createWriteStream|cpSync|renameSync|symlinkSync|linkSync|mkdirSync)\s*\(|>>?\s*["']?[~$/]/i.test(text) &&
+      /\bhomedir\s*\(|process\.env\.(?:HOME|USERPROFILE|APPDATA|LOCALAPPDATA|XDG_\w+)\b|\$HOME\b|['"`]~\/|['"`]\/(?:etc|usr|Library|var|opt|System)\/|\.(?:bashrc|zshrc|bash_profile|profile)\b|LaunchAgents|crontab|systemd\/|[\\/]\.claude[\\/]|[\\/]\.vscode[\\/]|[\\/]\.ssh[\\/]/i.test(text),
+  },
+  {
+    label: "reads credentials or the environment",
+    test: (text) =>
+      /JSON\.stringify\s*\(\s*process\.env\s*\)|Object\.(?:keys|entries|values)\s*\(\s*process\.env\s*\)|\bos\.environ\s*(?:\)|\.copy|\.items)|\.npmrc\b|\.ssh[\\/]|\bid_(?:rsa|ed25519)\b|\.aws[\\/]|\.docker[\\/]config|\b(?:NPM_TOKEN|GITHUB_TOKEN|GH_TOKEN|NODE_AUTH_TOKEN|AWS_SECRET_ACCESS_KEY)\b|trufflehog|find-(?:generic|internet)-password|Login Data|\bwallet\.dat\b/i.test(text),
+  },
+  {
+    label: "is obfuscated",
+    test: (text) =>
+      /\b_0x[0-9a-f]{4,}\b|\b(?:eval|Function)\s*\(\s*(?:atob|Buffer\.from)\b|String\.fromCharCode\s*\((?:\s*\d+\s*,){8}|[A-Za-z0-9+/]{400,}={0,2}|(?:\\x[0-9a-f]{2}){24}|(?:\\u[0-9a-f]{4}){24}/i.test(text),
+  },
+]
+
+export function installHookCapabilities(texts: readonly string[]): string[] {
+  const text = texts.join("\n")
+  return INSTALL_CAPABILITIES.filter(({ test }) => test(text)).map(({ label }) => label)
+}
+
+/**
+ * Rate shape-only install-hook findings by what the hook's script can do.
+ *
+ * - Every file the hook runs is in the repository and was read, and none of
+ *   it downloads-and-executes, writes outside the project, reads
+ *   credentials or the environment, or is obfuscated: informational.
+ * - Any of those capabilities: the rule's own severity, with the capability
+ *   named.
+ * - A script the hook runs is not in the repository: the rule's own
+ *   severity. The code that runs on `npm install` cannot be reviewed from
+ *   the source, which is the concealment the rule exists for.
+ * - A file that exists but was not read: unchanged — not knowing is not
+ *   evidence of safety.
+ *
+ * Reputation (stars, age, owner) plays no part: a popular repository whose
+ * hook gains one of these capabilities is the attack this is here for.
+ */
+export function applyInstallHookCapabilities(
+  findings: GitHubFinding[],
+  hooks: readonly InstallHook[],
+  contents: ReadonlyMap<string, string>,
+  inRepository: (path: string) => boolean
+): void {
+  for (const finding of findings) {
+    if (!finding.pattern || !INSTALL_HOOK_SHAPE_RULES.has(finding.pattern)) continue
+    const manifestHooks = hooks.filter((hook) => hook.manifest === finding.file && hook.targets.length > 0)
+    if (manifestHooks.length === 0) continue
+    const files = installHookClosure(manifestHooks, contents)
+    const targets = manifestHooks.flatMap((hook) => hook.targets)
+    const missing = targets.filter((path) => !inRepository(path))
+    const unread = files.filter((path) => !missing.includes(path) && inRepository(path) && !contents.has(path))
+    const names = manifestHooks.map((hook) => `${hook.hook}: ${hook.command}`).join("; ")
+    if (missing.length > 0) {
+      finding.description += ` The hook runs ${missing.join(", ")}, which is not in the repository, so what it does on install cannot be reviewed.`
+      continue
+    }
+    if (unread.length > 0) continue
+    const capabilities = installHookCapabilities([
+      ...manifestHooks.map((hook) => hook.command),
+      ...files.map((path) => contents.get(path) ?? ""),
+    ])
+    if (capabilities.length > 0) {
+      finding.description += ` The script it runs ${capabilities.join(", ")}.`
+      continue
+    }
+    finding.severity = "info"
+    finding.confidence = "high"
+    finding.cloneBlocking = false
+    finding.description =
+      `Install hook (${names}) runs local setup only: no download-and-execute, no writes outside the ` +
+      `project, no credential or environment access, no obfuscation in ${files.join(", ")}.`
+    finding.codeExplanation =
+      "This script runs on `npm install` (not on clone). It was read in full and does only local setup."
+  }
+}
 
 function checkPostinstallScripts(content: string, filePath: string): GitHubFinding[] {
   const findings: GitHubFinding[] = []
@@ -1669,6 +1872,18 @@ function detectSuspiciousPackageNames(content: string, filePath: string): GitHub
   return findings
 }
 
+/**
+ * A password-shaped assignment whose value is a stand-in: the word itself
+ * (`password: 'password'`, `_password: 'authPassword'`), a selector
+ * (`password: "[type=password]"`), a template (`"{{ vault_password }}"`,
+ * `` `${PASS}` ``), or one of the documented defaults examples ship with.
+ */
+export function isPlaceholderPassword(match: string): boolean {
+  if (isObviousPlaceholderSecret(match)) return true
+  const value = match.match(/['"]([^'"]*)['"]\s*$/)?.[1] ?? ""
+  return /pass(?:word|wd)?|secret|changeit|changeme|example|dummy|placeholder|sample|\{\{|\$\{|%\(|<[\w-]+>|\[type=|\*{3,}|x{4,}/i.test(value)
+}
+
 function detectHardcodedSecrets(
   content: string,
   filePath: string,
@@ -1679,11 +1894,15 @@ function detectHardcodedSecrets(
   if (isTestFile(filePath)) return findings
 
   const secretPatterns = [
-    { pattern: /(?:api[_-]?key|apikey)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "API Key", severity: "high" as const, ruleId: "HARDCODED_API_KEY" },
-    { pattern: /(?:secret[_-]?key|secret)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Secret Key", severity: "high" as const, ruleId: "HARDCODED_API_KEY" },
-    { pattern: /(?:password|passwd|pwd)\s*[:=]\s*['"]([^'"]{8,})['"]/gi, type: "Password", severity: "medium" as const, ruleId: null },
-    { pattern: /(?:token|auth[_-]?token)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Auth Token", severity: "high" as const, ruleId: "HARDCODED_API_KEY" },
-    { pattern: /(?:private[_-]?key|privatekey)\s*[:=]\s*['"]([^'"]{20,})['"]/gi, type: "Private Key", severity: "high" as const, ruleId: "HARDCODED_API_KEY" },
+    { pattern: /(?:api[_-]?key|apikey)\s*[:=]\s*['"]([^'"\n]{20,})['"]/gi, type: "API Key", severity: "high" as const, ruleId: "HARDCODED_API_KEY" },
+    { pattern: /(?:secret[_-]?key|secret)\s*[:=]\s*['"]([^'"\n]{20,})['"]/gi, type: "Secret Key", severity: "high" as const, ruleId: "HARDCODED_API_KEY" },
+    // The value is one string literal on one line. Letting it span lines let
+    // a prompt's own closing quote open the "value": npm's
+    // `read.password('Password:', creds.password)` matched from `Password:'`
+    // to the next quote on a later line.
+    { pattern: /(?:password|passwd|pwd)\s*[:=]\s*['"]([^'"\n]{8,})['"]/gi, type: "Password", severity: "medium" as const, ruleId: null },
+    { pattern: /(?:token|auth[_-]?token)\s*[:=]\s*['"]([^'"\n]{20,})['"]/gi, type: "Auth Token", severity: "high" as const, ruleId: "HARDCODED_API_KEY" },
+    { pattern: /(?:private[_-]?key|privatekey)\s*[:=]\s*['"]([^'"\n]{20,})['"]/gi, type: "Private Key", severity: "high" as const, ruleId: "HARDCODED_API_KEY" },
     { pattern: /AKIA[0-9A-Z]{16}/g, type: "AWS Access Key", severity: "critical" as const, ruleId: "HARDCODED_AWS_KEY" },
     { pattern: /ghp_[a-zA-Z0-9]{36}/g, type: "GitHub Personal Access Token", severity: "critical" as const, ruleId: "HARDCODED_GITHUB_TOKEN" },
     { pattern: /gho_[a-zA-Z0-9]{36}/g, type: "GitHub OAuth Token", severity: "critical" as const, ruleId: "HARDCODED_GITHUB_TOKEN" },
@@ -1704,7 +1923,13 @@ function detectHardcodedSecrets(
         ? matches.filter((match) => !isDocumentedAwsExampleKey(match))
         : genericSecret
           ? matches.filter((match) => !isObviousPlaceholderSecret(match))
-          : matches
+          : type === "Password"
+            ? matches.filter((match) => !isPlaceholderPassword(match))
+            : matches
+      // A password placeholder is not a credential at all, so it is not
+      // reported even as a deployment warning: `password: "changeit"` in an
+      // example server, a CSS selector `[type=password]`, a template.
+      if (actionableMatches.length === 0 && type === "Password") continue
       if (actionableMatches.length === 0) {
         placeholderRegexes.push(pattern)
         continue
@@ -1870,6 +2095,33 @@ function detectCryptoMining(
   return findings
 }
 
+const NETWORK_SINK =
+  /(?:\bfetch\s*\(|\baxios(?:\.(?:post|put|patch|request))?\s*\(|navigator\.sendBeacon\s*\(|XMLHttpRequest|new\s+WebSocket\s*\(|\bio\s*\()/gi
+// A destination that stays on the page's own origin: a path (`/login`,
+// `./api`), or a loopback URL. Anything else — an absolute URL to another
+// host, or a URL held in a variable — may leave it.
+const SAME_ORIGIN_DESTINATION =
+  /^\s*(?:(['"`])(?:\/(?!\/)|\.{1,2}\/|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?=[:/'"`])|\1))/
+
+/**
+ * Whether `text` contains a network call that can carry data off the page's
+ * own origin. `io({...})` with no URL connects back to the serving host.
+ */
+export function hasCrossOriginSink(text: string): boolean {
+  for (const sink of text.matchAll(NETWORK_SINK)) {
+    const rest = text.slice((sink.index ?? 0) + sink[0].length)
+    if (/XMLHttpRequest/i.test(sink[0])) {
+      const open = rest.match(/\.open\s*\(\s*['"`]\w+['"`]\s*,([^]{0,200})/)
+      if (!open || !SAME_ORIGIN_DESTINATION.test(open[1]!)) return true
+      continue
+    }
+    // `io()` / `io({ auth })` with no URL connects back to the serving host.
+    if (/\bio\s*\($/.test(sink[0]) && /^\s*[{)]/.test(rest)) continue
+    if (!SAME_ORIGIN_DESTINATION.test(rest)) return true
+  }
+  return false
+}
+
 function detectDataExfiltration(
   content: string,
   filePath: string,
@@ -1882,14 +2134,6 @@ function detectDataExfiltration(
   const exfiltrationPatterns = [
     { pattern: /navigator\.clipboard\.read(?:Text)?\s*\(/gi, type: "Clipboard Access", severity: "high" as const, ruleId: "EXFIL_CLIPBOARD" },
     { pattern: /document\.cookie/gi, type: "Cookie Access", severity: "high" as const, ruleId: "EXFIL_COOKIE" },
-    // Reading a password field is worth noting on its own. Reading an
-    // ordinary input is not: `input.value` and `emailInput.value` are how
-    // every form in every UI is written, so on its own it flagged React's own
-    // `ReactInputSelection.js`. What makes it exfiltration is the send, so
-    // that is what the generic form of this pattern now requires — the same
-    // shape as Form Data Transmission below.
-    { pattern: /password[\w-]*\.value/gi, type: "Password Field Access", severity: "medium" as const, ruleId: null },
-    { pattern: /(?:input|email)[\w-]*\.value[\s\S]{0,200}?(?:fetch\s*\(|axios|XMLHttpRequest|sendBeacon|new\s+WebSocket)/gi, type: "Form Data Access", severity: "medium" as const, ruleId: null },
     { pattern: /new\s+FormData\s*\([^)]*\)[\s\S]{0,100}(?:fetch|axios|XMLHttpRequest)/gi, type: "Form Data Transmission", severity: "medium" as const, ruleId: null },
   ].filter(({ ruleId }) => !ruleId || !coveredRuleIds.has(ruleId))
 
@@ -1905,19 +2149,39 @@ function detectDataExfiltration(
     }
   }
 
+  // Reading an input is how every form in every UI is written: React's own
+  // `ReactInputSelection.js` reads `input.value`, and every login page reads
+  // its password field. A password read on its own used to count, which
+  // flagged every login example — socket.io's passport examples among them.
+  // What makes it exfiltration is the value reaching a sink that can leave
+  // the origin, so that is what this requires.
+  const formFieldRead = /(?:input|email|password|passwd|credential)[\w-]*\.value\b/gi
+  for (const match of content.matchAll(formFieldRead)) {
+    const start = (match.index ?? 0) + match[0].length
+    if (hasCrossOriginSink(content.slice(start, start + 200))) {
+      detectedPatterns.push(/pass|credential/i.test(match[0]) ? "Credential Field Transmission" : "Form Data Access")
+      matchedRegexes.push(formFieldRead, NETWORK_SINK)
+      break
+    }
+  }
+
   // Reading a saved theme, locale, or UI preference is not exfiltration.
   // Require a sensitive-looking storage key and a network sink in the same
   // local region before reporting browser-storage transmission.
   const sensitiveStorageRead =
     /(?:localStorage|sessionStorage)\.getItem\s*\(\s*['"][^'"]*(?:token|secret|password|credential|session|auth|wallet|seed|private)[^'"]*['"]\s*\)/gi
+  //
+  // The sink has to be able to reach another host. A token read from storage
+  // and sent as `authorization` to `fetch('/self')` is how a single-page app
+  // talks to its own server: socket.io's passport-jwt examples were rated
+  // high for exactly that. Storing or using a token locally is not
+  // exfiltration; sending it somewhere else is.
   for (const match of content.matchAll(sensitiveStorageRead)) {
     const start = match.index ?? 0
     const region = content.slice(start, start + 2_000)
-    const networkSink =
-      /(?:fetch\s*\(|axios\.(?:post|put|patch)\s*\(|navigator\.sendBeacon\s*\(|XMLHttpRequest|WebSocket)/gi
-    if (networkSink.test(region)) {
+    if (hasCrossOriginSink(region)) {
       detectedPatterns.push("Sensitive Storage Transmission")
-      matchedRegexes.push(sensitiveStorageRead, networkSink)
+      matchedRegexes.push(sensitiveStorageRead, NETWORK_SINK)
       highestSeverity = "high"
       break
     }
@@ -2068,7 +2332,11 @@ function detectSuspiciousFileAccess(
     { pattern: /(?:fs\.read|readFileSync|readFile)\s*\([^)]*(?:\.ssh|\.aws|\.gnupg|\.docker|id_rsa|credentials)/gi, type: "SSH/AWS Credentials Access", severity: "critical" as const, ruleId: "FILE_ACCESS_CREDENTIALS" },
     { pattern: /(?:fs\.read|readFileSync|readFile)\s*\([^)]*(?:etc\/passwd|etc\/shadow|\.bash_history|\.zsh_history)/gi, type: "System File Access", severity: "critical" as const, ruleId: "FILE_ACCESS_SYSTEM" },
     { pattern: /(?:fs\.read|readFileSync|readFile)\s*\([^)]*(?:Chrome|Firefox|Safari|Edge)[\w\s/\\]*(?:Cookies|Login|History)/gi, type: "Browser Data Access", severity: "critical" as const, ruleId: "FILE_ACCESS_BROWSER_DATA" },
-    { pattern: /(?:fs\.write|writeFileSync|writeFile)\s*\([^)]*(?:\/etc|\/sys|\/bin|C:\\\\Windows)/gi, type: "System Directory Write", severity: "medium" as const, ruleId: null },
+    // The destination is the first argument, and it has to be rooted in a
+    // system directory. Matching `/bin` anywhere before the next `)` read the
+    // *contents* being written — a `#!/usr/bin/env node` or `#!/bin/sh`
+    // shebang — as the target: next.js's and pnpm's bin-placeholder scripts.
+    { pattern: /(?:fs\.write\w*|writeFileSync|writeFile|appendFileSync|appendFile)\s*\(\s*(?:path\.(?:join|resolve)\s*\(\s*)?['"`](?:\/(?:etc|sys|bin|sbin|usr\/(?:s?bin|lib|local\/bin))\b|[A-Za-z]:\\\\Windows)/gi, type: "System Directory Write", severity: "medium" as const, ruleId: null },
   ].filter(({ ruleId }) => !ruleId || !coveredRuleIds.has(ruleId))
 
   for (const { pattern, type, severity } of fileAccessPatterns) {
