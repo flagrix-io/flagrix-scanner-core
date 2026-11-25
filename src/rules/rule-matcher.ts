@@ -1,5 +1,6 @@
 import type { GitHubFinding, YaraRule } from "../types/index.js"
 import { collectEvidence } from "../utils/evidence.js"
+import { maskComments } from "../utils/mask.js"
 
 // Test file patterns — skip or reduce severity for these paths
 const TEST_FILE_PATTERNS = [
@@ -69,6 +70,33 @@ const CASE_SENSITIVE_RULE_IDS = new Set([
 ])
 
 /**
+ * Rules whose whole subject is executable syntax, matched against the file
+ * with its comments masked.
+ *
+ * A comment that names an attack cannot carry it out. `stratum+tcp://` in a
+ * comment is documentation; in a string it is where the miner sends its
+ * work. This scanner's own source explains every narrowed pattern in a
+ * comment beside it, so it scanned itself as a critical-severity crypto
+ * miner (`pool.supportxmr.com`, `new Function('module', 'exports',
+ * 'require', src)`) — as would any security tool, IOC list or tutorial.
+ *
+ * A rule belongs here only when a mention in prose proves nothing and the
+ * real thing is always code: both of these match a construct a program has
+ * to execute. Rules that exist to read comments (invisible Unicode, bidi
+ * controls, hidden agent instructions, non-English comments) must never be
+ * added — a payload parked in a comment is exactly what they are for.
+ */
+const COMMENT_EXEMPT_RULE_IDS = new Set(["CRYPTO_MINER", "OBF_NEW_FUNCTION"])
+
+/**
+ * Comment masking is JavaScript's lexer, so it is applied to JS/TS only.
+ * `//` opens no comment in Python, Ruby or a shell script, where it is the
+ * middle of a URL, and `#` — which does — appears in too much ordinary shell
+ * code (`${#array}`, `$#`) to blank out by regex.
+ */
+const JS_TS_SCOPE = /\.(?:[cm]?js|ts|[jt]sx)$/i
+
+/**
  * A keyboard listener is normal UI code. Treat it as keylogging only when the
  * nearby handler both reads the pressed key and stores or transmits it.
  */
@@ -105,6 +133,14 @@ export function applyYaraRules(
 ): GitHubFinding[] {
   const findings: GitHubFinding[] = []
   const isTest = isTestFile(scopePath)
+  // Masked once per file, and only if a rule in this set is reached.
+  const commentMaskable = JS_TS_SCOPE.test(scopePath)
+  let codeOnly: string | null = null
+  const subjectFor = (rule: YaraRule): string => {
+    if (!commentMaskable || !COMMENT_EXEMPT_RULE_IDS.has(rule.id)) return content
+    codeOnly ??= maskComments(content)
+    return codeOnly
+  }
 
   for (const rule of rules) {
     try {
@@ -134,7 +170,8 @@ export function applyYaraRules(
         rule.pattern,
         CASE_SENSITIVE_RULE_IDS.has(rule.id) ? "g" : "gi"
       )
-      const matches = content.match(regex)
+      const subject = subjectFor(rule)
+      const matches = subject.match(regex)
       // Honor the rule's match threshold (e.g. "6+ base64 strings" — a single
       // occurrence of a legitimate encoding is not a signal).
       const required = rule.minMatches && rule.minMatches > 1 ? rule.minMatches : 1
@@ -156,7 +193,7 @@ export function applyYaraRules(
             file: filePath,
             pattern: rule.id,
             description: "Predictable placeholder secret must be replaced before deployment",
-            evidence: collectEvidence(content, regex),
+            evidence: collectEvidence(subject, regex),
           })
           continue
         }
@@ -166,7 +203,7 @@ export function applyYaraRules(
         const contextName =
           rule.context ?? (rule.id === "EXFIL_KEYLOGGER" ? "keyboard-capture" : undefined)
         const context =
-          contextName === "keyboard-capture" ? detectKeyboardCapture(content) : null
+          contextName === "keyboard-capture" ? detectKeyboardCapture(subject) : null
         if (contextName && !context) continue
         findings.push({
           severity: rule.severity as GitHubFinding["severity"],
@@ -175,7 +212,7 @@ export function applyYaraRules(
           file: filePath,
           pattern: rule.id,
           description: rule.description,
-          evidence: collectEvidence(content, context?.evidencePatterns ?? regex),
+          evidence: collectEvidence(subject, context?.evidencePatterns ?? regex),
         })
       }
     } catch {

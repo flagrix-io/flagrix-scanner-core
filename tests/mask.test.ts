@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { maskRegexLiterals, maskStringLiterals } from "../src/utils/mask.js"
+import { maskComments, maskRegexLiterals, maskStringLiterals } from "../src/utils/mask.js"
 
 describe("maskRegexLiterals", () => {
   it("blanks a regex literal describing a keylogger", () => {
@@ -112,5 +112,63 @@ describe("masking does not manufacture whitespace padding", () => {
     const masked = maskRegexLiterals(`const re = /child_process/\n`)
     expect(masked).not.toContain("child_process")
     expect(masked.length).toBe(`const re = /child_process/\n`.length)
+  })
+})
+
+describe("maskComments", () => {
+  it("blanks a mining pool named in a line comment", () => {
+    const line = `    // require a host: \`stratum+tcp://pool.minexmr.com:3333\``
+    const masked = maskComments(line)
+    expect(masked).not.toContain("stratum")
+    expect(masked.startsWith("    //")).toBe(true) // delimiter kept
+    expect(masked.length).toBe(line.length) // offsets preserved
+  })
+
+  it("blanks a block comment and keeps its line count", () => {
+    const content = [
+      "const a = 1",
+      "/*",
+      " * new Function('module', 'exports', 'require', src)",
+      " */",
+      "const b = 2",
+    ].join("\n")
+    const masked = maskComments(content)
+    expect(masked).not.toContain("new Function")
+    expect(masked.split("\n")).toHaveLength(5)
+    expect(masked.split("\n")[4]).toBe("const b = 2")
+  })
+
+  it("leaves real code untouched", () => {
+    const line = `const f = new Function("return " + src)`
+    expect(maskComments(line)).toBe(line)
+  })
+
+  it("keeps a payload that lives in a string", () => {
+    const line = `const pool = "stratum+tcp://pool.supportxmr.com:3333"`
+    expect(maskComments(line)).toBe(line)
+  })
+
+  it("does not read a URL's slashes as a comment", () => {
+    const line = `fetch("https://example.com/a") // see xmrig notes`
+    const masked = maskComments(line)
+    expect(masked).toContain(`fetch("https://example.com/a")`)
+    expect(masked).not.toContain("xmrig")
+  })
+
+  it("does not read a comment marker inside a template literal as a comment", () => {
+    const line = "const sh = `curl https://example.com/x | sh`"
+    expect(maskComments(line)).toBe(line)
+  })
+
+  it("masks to the end of an unterminated block comment", () => {
+    const content = "const a = 1\n/* xmrig\nmore"
+    const masked = maskComments(content)
+    expect(masked).not.toContain("xmrig")
+    expect(masked.length).toBe(content.length)
+  })
+
+  it("preserves division and ordinary slashes", () => {
+    const line = "const rate = total / count"
+    expect(maskComments(line)).toBe(line)
   })
 })
