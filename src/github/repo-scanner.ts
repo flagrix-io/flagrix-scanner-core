@@ -39,6 +39,7 @@ import {
   calculateRiskScore,
   calculateSignalContributions,
   getRiskLevel,
+  isExecutedConfig,
 } from "../utils/risk-calculator.js"
 import {
   applyYaraRules,
@@ -94,6 +95,36 @@ const SCANNABLE_EXTENSIONS = [
 const CONTAINER_BUILD_FILE = /(?:^|\/)(?:[\w.-]+[-.])?(?:Dockerfile|Containerfile)(?:[-.][\w.-]+)?$/i
 const COMPOSE_FILE = /(?:^|\/)(?:[\w-]+-)?compose(?:\.[\w-]+)*\.ya?ml$/i
 
+/**
+ * The file names git runs as hooks (githooks(5)). A repo can switch its own
+ * hooks on: `"prepare": "git config core.hooksPath .githooks"` runs on
+ * `npm install`, husky's `"prepare": "husky"` does the same for `.husky/`,
+ * and from then on every `git commit`, `git push` or `git checkout` runs the
+ * committed file on the host. Hooks have no extension, so they used to be
+ * skipped as `unsupported-type`. Only these names count: a README in
+ * `.githooks/` is not a hook, and husky's generated runners live one level
+ * down in `.husky/_/`.
+ */
+const GIT_HOOK_NAMES = [
+  "applypatch-msg", "pre-applypatch", "post-applypatch",
+  "pre-commit", "pre-merge-commit", "prepare-commit-msg", "commit-msg", "post-commit",
+  "pre-rebase", "post-checkout", "post-merge", "pre-push", "post-rewrite",
+  "pre-receive", "update", "proc-receive", "post-receive", "post-update",
+  "reference-transaction", "push-to-checkout", "pre-auto-gc", "sendemail-validate",
+  "fsmonitor-watchman", "post-index-change",
+  "p4-changelist", "p4-prepare-changelist", "p4-post-changelist", "p4-pre-submit",
+]
+const GIT_HOOK_NAME = new RegExp(`^(?:${GIT_HOOK_NAMES.join("|")})$`)
+/** Hooks in the two folders repos commit them to by convention. */
+const GIT_HOOK_FILE = new RegExp(`(?:^|/)\\.(?:githooks|husky)/(?:${GIT_HOOK_NAMES.join("|")})$`)
+/**
+ * Hook files read per scan from folders that a `core.hooksPath` setting in
+ * package.json points to (on top of the two conventional folders, which are
+ * configs). More than every hook name in one folder, few enough that a
+ * manifest naming many folders cannot spend a caller's request budget.
+ */
+const MAX_HOOKS_PATH_FILES = 30
+
 const CONFIG_FILE_PATTERNS: RegExp[] = [
   /(?:^|\/)\.vscode\/(?:tasks|settings|launch|mcp)\.json$/,
   /(?:^|\/)\.claude\/settings(?:\.local)?\.json$/,
@@ -107,6 +138,9 @@ const CONFIG_FILE_PATTERNS: RegExp[] = [
   // RUN steps, `command:`, privileged containers, docker-socket mounts.
   CONTAINER_BUILD_FILE,
   COMPOSE_FILE,
+  // Git hooks: run on the host by `git commit` once core.hooksPath points
+  // at them (see GIT_HOOK_NAMES).
+  GIT_HOOK_FILE,
   /^\.github\/workflows\/[^/]+\.ya?ml$/,
   /(?:^|\/)README(?:\.md|\.txt|\.rst)?$/i,
   /(?:^|\/)(?:AGENTS|CLAUDE|GEMINI)\.md$/,
@@ -125,11 +159,15 @@ const CONFIG_FILE_PATTERNS: RegExp[] = [
  * A Dockerfile's content is shell and a compose file's is YAML, so each keeps
  * the generic suffix (every `.sh` / `.yml` rule still applies) behind a
  * type-specific one, which is how a rule targets just that file type:
- * `.dockerfile.sh` for container builds, `.compose.yml` for compose files.
+ * `.dockerfile.sh` for container builds, `.compose.yml` for compose files,
+ * `.githook.sh` for git hooks (whose content is a shell script, or a script
+ * whose shebang names another interpreter).
  * Name lists cannot do this job — `Dockerfile.prod` and `prod.Dockerfile`
- * are the same file type under a different basename.
+ * are the same file type under a different basename, and a hook's name says
+ * when it runs, not that it is one.
  */
-function configRuleScope(path: string): string {
+function configRuleScope(path: string, gitHook = GIT_HOOK_FILE.test(path)): string {
+  if (gitHook) return `${path}.githook.sh`
   if (CONTAINER_BUILD_FILE.test(path)) return `${path}.dockerfile.sh`
   if (COMPOSE_FILE.test(path)) return `${path}.compose.yml`
   return path
@@ -292,12 +330,22 @@ const PROJECT_DIR_VARIABLE =
 // Configs inside these dot-dirs run from the folder that holds the dot-dir.
 const DOT_DIR_CONFIG = /^(?:(.*)\/)?\.(?:vscode|claude|cursor|amazonq|gemini|windsurf|roo|kiro|github|devcontainer)\//
 
-/** Repo paths that a config file runs with node/bun/deno/tsx. */
-export function extractCommandTargets(content: string, configPath: string): string[] {
+/**
+ * Repo paths that a config file runs with node/bun/deno/tsx. Git runs hooks
+ * from the top of the work tree, so a hook's paths resolve from the repo root
+ * (`fromRoot`) rather than from the folder that holds it.
+ */
+export function extractCommandTargets(
+  content: string,
+  configPath: string,
+  fromRoot = GIT_HOOK_FILE.test(configPath)
+): string[] {
   const dotDir = configPath.match(DOT_DIR_CONFIG)
-  const base = dotDir
-    ? (dotDir[1] ?? "")
-    : configPath.includes("/") ? configPath.slice(0, configPath.lastIndexOf("/")) : ""
+  const base = fromRoot
+    ? ""
+    : dotDir
+      ? (dotDir[1] ?? "")
+      : configPath.includes("/") ? configPath.slice(0, configPath.lastIndexOf("/")) : ""
   const text = content.replace(PROJECT_DIR_VARIABLE, ".")
   const targets = new Set<string>()
   for (const match of text.matchAll(RUNTIME_INVOCATION)) {
@@ -326,6 +374,42 @@ function resolveRepoPath(base: string, raw: string): string | null {
     }
   }
   return segments.length > 0 ? segments.join("/") : null
+}
+
+// `git config [--local] core.hooksPath <dir>`. Git config keys ignore case.
+const GIT_CONFIG_HOOKS_PATH =
+  /\bgit\s+config\s+(?:-{1,2}[\w-]+\s+)*core\.hooksPath\s+["']?([^\s"'`&|;<>()]+)/gi
+// `husky <dir>` (v9) and `husky install <dir>` (v4–8) set core.hooksPath to
+// <dir>. Bare `husky` / `husky install` mean `.husky`, already a config.
+const HUSKY_HOOKS_DIR =
+  /\bhusky(?:\s+install)?\s+(?!(?:install|init|add|set|uninstall)\b|-)["']?([^\s"'`&|;<>()]+)/g
+
+/**
+ * Repo folders that a package.json script points `core.hooksPath` at,
+ * resolved from the manifest's folder (npm runs scripts there). A path
+ * outside the repo (absolute, `~`, `$HOME`) resolves to nothing: there is no
+ * committed hook to read.
+ */
+export function extractHooksPaths(content: string, manifestPath: string): string[] {
+  let scripts: unknown
+  try {
+    scripts = (JSON.parse(content) as { scripts?: unknown }).scripts
+  } catch {
+    return []
+  }
+  if (!scripts || typeof scripts !== "object") return []
+  const base = manifestPath.includes("/") ? manifestPath.slice(0, manifestPath.lastIndexOf("/")) : ""
+  const dirs = new Set<string>()
+  for (const script of Object.values(scripts)) {
+    if (typeof script !== "string") continue
+    for (const pattern of [GIT_CONFIG_HOOKS_PATH, HUSKY_HOOKS_DIR]) {
+      for (const match of script.matchAll(pattern)) {
+        const dir = resolveRepoPath(base, match[1]!)
+        if (dir) dirs.add(dir)
+      }
+    }
+  }
+  return [...dirs]
 }
 
 /**
@@ -601,6 +685,19 @@ export async function scanGitHubRepo(
     // coverage of the auto-run files. Tree order is kept inside each tier.
     sortByPriority(configCandidates, configPriority)
 
+    // Files named like a git hook outside the conventional folders, by
+    // folder. One becomes a hook only when a package.json script points
+    // core.hooksPath at its folder, which is known once the manifest is read.
+    const hookNamedByDir = new Map<string, GitHubTreeItem[]>()
+    for (const item of tree.tree) {
+      if (item.type !== "blob" || isConfigFile(item.path)) continue
+      const slash = item.path.lastIndexOf("/")
+      if (slash === -1 || !GIT_HOOK_NAME.test(item.path.slice(slash + 1))) continue
+      if (item.size !== undefined && item.size > MAX_FILE_SIZE_BYTES) continue
+      const dir = item.path.slice(0, slash)
+      hookNamedByDir.set(dir, [...(hookNamedByDir.get(dir) ?? []), item])
+    }
+
     /** The longest prefix of `items` whose sizes fit in `budget` bytes. */
     const bytePrefix = (items: GitHubTreeItem[], budget: number, maxCount = Infinity) => {
       let bytes = 0
@@ -683,8 +780,13 @@ export async function scanGitHubRepo(
           }
           return body
         }
+        // Hook-named files ride along too, so a hooks folder that a manifest
+        // turns out to name costs no request of its own. They are small and
+        // few; one that no manifest names is simply never read.
+        const hookNamed = [...hookNamedByDir.values()].flat().slice(0, MAX_HOOKS_PATH_FILES)
         const wanted = new Set(
-          [...candidate.configs, ...candidate.fonts, ...candidate.sources].map((item) => item.path)
+          [...candidate.configs, ...candidate.fonts, ...candidate.sources, ...hookNamed]
+            .map((item) => item.path)
         )
         const read = await readRepoTarball(
           repo.owner, repo.repo, commitSha, wanted, headers, fetch, keepFromArchive
@@ -718,6 +820,11 @@ export async function scanGitHubRepo(
     )
     const queued = new Set(filesToScan.map((item) => item.path))
     const commandTargets = new Set<string>()
+    // Hook files a package.json's core.hooksPath setting switched on, outside
+    // the folders GIT_HOOK_FILE already covers. They are read as hooks.
+    const hooksPathFiles = new Set<string>()
+    const isGitHook = (path: string) => GIT_HOOK_FILE.test(path) || hooksPathFiles.has(path)
+    const isConfig = (path: string) => isConfigFile(path) || hooksPathFiles.has(path)
     const installHooks: InstallHook[] = []
     const installHookFiles = new Set<string>()
     const unskip = (path: string) => {
@@ -864,10 +971,10 @@ export async function scanGitHubRepo(
       const content = read.content
 
       if (
-        (isConfigFile(file.path) && !runsOffHost(file.path)) ||
+        (isConfig(file.path) && !runsOffHost(file.path)) ||
         file.path.endsWith("package.json")
       ) {
-        for (const target of extractCommandTargets(content, file.path)) {
+        for (const target of extractCommandTargets(content, file.path, isGitHook(file.path))) {
           if (commandTargets.size >= MAX_COMMAND_TARGETS) break
           const item = blobsByPath.get(target)
           if (!item || queued.has(target)) continue
@@ -929,6 +1036,19 @@ export async function scanGitHubRepo(
           findings.push(...postinstallFindings)
           patternsMatched += postinstallFindings.length
           installHooks.push(...readInstallHooks(content, file.path))
+
+          // A script that points core.hooksPath at a folder makes the hooks
+          // in it run on every commit: read them as hooks, next generation.
+          for (const dir of extractHooksPaths(content, file.path)) {
+            for (const item of hookNamedByDir.get(dir) ?? []) {
+              if (hooksPathFiles.size >= MAX_HOOKS_PATH_FILES) break
+              if (queued.has(item.path)) continue
+              unskip(item.path)
+              queued.add(item.path)
+              hooksPathFiles.add(item.path)
+              filesToScan.push(item)
+            }
+          }
         }
       }
 
@@ -941,12 +1061,12 @@ export async function scanGitHubRepo(
 
       // Editor/agent/CI configs, docs and package manifests: data-driven
       // rules only (scoped by each rule's fileExtensions / fileNames).
-      if (!isSource && (isConfigFile(file.path) || file.path.endsWith("package.json"))) {
+      if (!isSource && (isConfig(file.path) || file.path.endsWith("package.json"))) {
         const configFindings = applyYaraRules(
           content,
           yaraRules,
           file.path,
-          configRuleScope(file.path)
+          configRuleScope(file.path, isGitHook(file.path))
         )
         findings.push(...configFindings)
         patternsMatched += configFindings.length
@@ -1105,10 +1225,13 @@ export async function scanGitHubRepo(
 
     const rawRiskScore = calculateRawRiskScore(findings)
     const riskScore = calculateRiskScore(findings)
-    const riskLevel = getRiskLevel(riskScore, findings)
+    // Hooks in a folder core.hooksPath named are executed configs too, which
+    // their path alone cannot say.
+    const executedConfig = (path: string) => isExecutedConfig(path) || isGitHook(path)
+    const riskLevel = getRiskLevel(riskScore, findings, executedConfig)
     const cloneBlockingFindings = findings.filter((finding) => finding.cloneBlocking !== false)
     const cloneRiskScore = calculateRiskScore(cloneBlockingFindings)
-    const cloneRiskLevel = getRiskLevel(cloneRiskScore, cloneBlockingFindings)
+    const cloneRiskLevel = getRiskLevel(cloneRiskScore, cloneBlockingFindings, executedConfig)
 
     return {
       riskScore,

@@ -170,3 +170,48 @@ describe("getRiskLevel", () => {
     expect(getRiskLevel(0.25, [maliciousDependency])).toBe("high")
   })
 })
+
+describe("the verdict floor for configs a tool executes", () => {
+  const inFile = (f: GitHubFinding, file: string): GitHubFinding => ({ ...f, file })
+  const padding = finding("high", "medium", "HIDDEN_CODE_WHITESPACE_PADDING")
+
+  it("makes one strong finding in an executed config at least medium", () => {
+    // The fixture's tailwind.config.js: 0.15 + 0.0375 scored low before.
+    const findings = [
+      inFile(padding, "tailwind.config.js"),
+      inFile(finding("medium", "low", "OBF_FROMCHARCODE"), "tailwind.config.js"),
+    ]
+    expect(calculateRiskScore(findings)).toBeCloseTo(0.1875)
+    expect(getRiskLevel(calculateRiskScore(findings), findings)).toBe("medium")
+  })
+
+  it("covers bundler, lint and test configs and committed hooks", () => {
+    for (const file of [
+      "next.config.mjs", "apps/web/vite.config.ts", "postcss.config.cjs",
+      ".eslintrc.cjs", ".githooks/pre-commit", ".husky/pre-push",
+    ]) {
+      expect(getRiskLevel(0.15, [inFile(padding, file)])).toBe("medium")
+    }
+  })
+
+  it("leaves the same finding in an ordinary source file to the score", () => {
+    expect(getRiskLevel(0.15, [inFile(padding, "src/config.js")])).toBe("low")
+    expect(getRiskLevel(0.15, [inFile(padding, "config/webpack.js")])).toBe("low")
+  })
+
+  it("is not raised by low-confidence, medium-severity or secret findings", () => {
+    const file = "tailwind.config.js"
+    expect(getRiskLevel(0.0625, [inFile(finding("high", "low", "X"), file)])).toBe("low")
+    expect(getRiskLevel(0.15, [inFile(finding("medium", "high", "X"), file)])).toBe("low")
+    expect(getRiskLevel(0.15, [inFile(finding("high", "medium", "HARDCODED_API_KEY"), file)])).toBe("low")
+    expect(getRiskLevel(0.25, [{
+      severity: "high", type: "HARDCODED_SECRETS", file, description: "secret",
+    }])).toBe("low")
+  })
+
+  it("takes the caller's idea of an executed config", () => {
+    const hooksPathHook = inFile(padding, "tools/hooks/pre-commit")
+    expect(getRiskLevel(0.15, [hooksPathHook])).toBe("low")
+    expect(getRiskLevel(0.15, [hooksPathHook], (path) => path.startsWith("tools/hooks/"))).toBe("medium")
+  })
+})

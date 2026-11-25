@@ -78,7 +78,11 @@ export function calculateRiskScore(findings: GitHubFinding[]): number {
  * credential-theft, or equivalent behavior) always means "high". A heuristic
  * critical match must not override the normal score bands by itself.
  */
-export function getRiskLevel(score: number, findings?: GitHubFinding[]): RiskLevel {
+export function getRiskLevel(
+  score: number,
+  findings?: GitHubFinding[],
+  executedConfig: (path: string) => boolean = isExecutedConfig
+): RiskLevel {
   if (findings?.some((f) =>
     (f.severity === "critical" && (f.confidence ?? "high") === "high") ||
     (f.type === "SUSPICIOUS_DEPENDENCY" &&
@@ -87,7 +91,45 @@ export function getRiskLevel(score: number, findings?: GitHubFinding[]): RiskLev
   )) {
     return "high"
   }
-  if (score < RISK_THRESHOLDS.low) return "low"
+  if (score < RISK_THRESHOLDS.low) {
+    return findings?.some((f) => raisesExecutedConfigFloor(f, executedConfig)) ? "medium" : "low"
+  }
   if (score < RISK_THRESHOLDS.high) return "medium"
   return "high"
+}
+
+/**
+ * Configs a tool loads and runs as code the moment it starts, with nobody
+ * choosing to run them: bundler, CSS, lint and test configs
+ * (`tailwind.config.js`, `next.config.mjs`, `vite.config.ts`,
+ * `.eslintrc.cjs`), which `npm run dev` or a build executes, and committed
+ * git hooks, which a commit executes. PolinRider-style loaders are appended
+ * to exactly these files.
+ */
+const EXECUTED_CONFIG =
+  /(?:^|\/)[\w.-]*\.config\.[cm]?[jt]s$|(?:^|\/)\.(?:eslintrc|babelrc|prettierrc|stylelintrc|mocharc)\.[cm]?js$|(?:^|\/)\.(?:githooks|husky)\/[\w-]+$/
+
+export function isExecutedConfig(path: string): boolean {
+  return EXECUTED_CONFIG.test(path)
+}
+
+/**
+ * The verdict floor for executed configs. One strong signal in a file that
+ * runs on `npm run dev` — code pushed off-screen behind whitespace in
+ * `tailwind.config.js` — scored 0.15 on its own, under the medium band, so
+ * the verdict said low about a file the reader's next command executes. A
+ * high or critical finding of medium or high confidence in such a file makes
+ * the verdict at least medium. Low-confidence heuristics stay in the score,
+ * and a leaked credential says the config exposes a secret, not that it runs
+ * anything, so those do not raise the floor.
+ */
+function raisesExecutedConfigFloor(
+  finding: GitHubFinding,
+  executedConfig: (path: string) => boolean
+): boolean {
+  if (finding.severity !== "high" && finding.severity !== "critical") return false
+  if ((finding.confidence ?? "high") === "low") return false
+  if (finding.type === "HARDCODED_SECRETS" || finding.type === "INSECURE_CONFIGURATION") return false
+  if (finding.pattern?.startsWith("HARDCODED_")) return false
+  return finding.file !== undefined && executedConfig(finding.file)
 }
