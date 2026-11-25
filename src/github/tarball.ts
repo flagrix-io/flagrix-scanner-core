@@ -49,6 +49,14 @@ export type TarballRead =
   | { ok: false; reason: TarballFallbackReason }
 
 /**
+ * Decides, once a wanted file's body has arrived, what of it to keep: the
+ * body itself, a shorter copy when its head already settles the question
+ * (a real font needs only its magic number), or null to keep nothing. It runs
+ * while the archive streams, so a file it trims or drops is never retained.
+ */
+export type TarballKeep = (path: string, body: Uint8Array) => Uint8Array | null
+
+/**
  * How big a repo may be, measured from the tree, before the tarball is worth
  * asking for. The tree is already in hand, so this is the only cap that costs
  * nothing to check: microsoft/vscode spent 30.6s reaching the compressed cap
@@ -99,7 +107,8 @@ export async function readRepoTarball(
   commitSha: string,
   wanted: ReadonlySet<string>,
   headers: Record<string, string>,
-  fetchImpl: typeof fetch = fetch
+  fetchImpl: typeof fetch = fetch,
+  keep?: TarballKeep
 ): Promise<TarballRead> {
   let response: Response
   try {
@@ -149,14 +158,20 @@ export async function readRepoTarball(
       Uint8Array,
       Uint8Array
     >
-    const files = await parseTar(response.body.pipeThrough(counter).pipeThrough(gunzip), wanted)
+    const { files, matched } = await parseTar(
+      response.body.pipeThrough(counter).pipeThrough(gunzip),
+      wanted,
+      keep
+    )
     // A body that decompresses but yields none of the wanted files is not a
     // tarball of this commit. Both the tree and the archive are pinned to the
     // same SHA, so every wanted blob should be in it; coming back empty means
     // the response was something else, or the archive's shape has changed.
     // Reporting that as a successful read would claim a coverage the scan
     // does not have and quietly send it down the per-file path file by file.
-    if (wanted.size > 0 && files.size === 0) {
+    // Counted by entries matched rather than files kept, since `keep` may
+    // rightly keep nothing of a file it has seen.
+    if (wanted.size > 0 && matched === 0) {
       return { ok: false, reason: "unreadable" }
     }
     return { ok: true, files, compressedBytes }
@@ -286,9 +301,11 @@ function stripRoot(name: string): string | null {
 
 async function parseTar(
   stream: ReadableStream<Uint8Array>,
-  wanted: ReadonlySet<string>
-): Promise<Map<string, Uint8Array>> {
+  wanted: ReadonlySet<string>,
+  keep: TarballKeep | undefined
+): Promise<{ files: Map<string, Uint8Array>; matched: number }> {
   const files = new Map<string, Uint8Array>()
+  const seen = new Set<string>()
   const reader = stream.getReader()
   const queue = new ByteQueue()
   let decompressedBytes = 0
@@ -339,7 +356,11 @@ async function parseTar(
             const body = entry.keep.bytes
             if (entry.nameOverride === "gnu") pendingName = readString(body, 0, body.byteLength)
             else if (entry.nameOverride === "pax") pendingName = paxPath(body)
-            else if (entry.keep.path !== null) files.set(entry.keep.path, body)
+            else if (entry.keep.path !== null) {
+              seen.add(entry.keep.path)
+              const kept = keep ? keep(entry.keep.path, body) : body
+              if (kept) files.set(entry.keep.path, kept)
+            }
           }
           entry = null
           continue
@@ -382,7 +403,7 @@ async function parseTar(
         // target is read through the per-file path, as it was before.
         const isFile = typeFlag === "0" || typeFlag === "\0"
         const path = stripRoot(name)
-        const keepIt = isFile && path !== null && wanted.has(path) && !files.has(path)
+        const keepIt = isFile && path !== null && wanted.has(path) && !seen.has(path)
 
         entry = {
           keep: keepIt ? { path: path!, bytes: new Uint8Array(size), filled: 0 } : null,
@@ -396,5 +417,5 @@ async function parseTar(
     await reader.cancel().catch(() => {})
   }
 
-  return files
+  return { files, matched: seen.size }
 }

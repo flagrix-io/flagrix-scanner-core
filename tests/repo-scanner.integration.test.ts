@@ -424,6 +424,29 @@ describe("scan transparency (scanned/skipped tracking)", () => {
     expect(result.scanSummary.skippedCount).toBe(5)
   })
 
+  it("lists budget skips ahead of the file types it never reads", async () => {
+    // A big repo's 500 listed skips used to be its first 500 images and
+    // lockfiles in tree order, so the files a budget left out never showed.
+    const files: Record<string, string> = {}
+    const sizes: Record<string, number> = {}
+    for (let i = 0; i < 600; i++) files[`assets/a${String(i).padStart(3, "0")}.png`] = ""
+    for (let i = 0; i < 205; i++) files[`src/f${String(i).padStart(3, "0")}.js`] = `export const x = ${i}\n`
+    files["src/vendor.js"] = "x"
+    sizes["src/vendor.js"] = 5 * 1024 * 1024
+    global.fetch = mockGitHubApi(files, sizes) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+
+    const listed = result.scanSummary.skippedFiles
+    expect(listed).toHaveLength(500)
+    expect(result.scanSummary.skippedCount).toBe(600 + 5 + 1)
+    expect(listed.slice(0, 6).map((s) => s.reason)).toEqual([
+      ...Array(5).fill("over-file-limit"),
+      "too-large",
+    ])
+    expect(listed[5]).toEqual({ path: "src/vendor.js", reason: "too-large" })
+    expect(listed.slice(6).every((s) => s.reason === "unsupported-type")).toBe(true)
+  })
+
   it("skips oversized blobs with too-large instead of fetching them", async () => {
     global.fetch = mockGitHubApi(
       { "src/small.js": `export const a = 1\n`, "dist/bundle.js": `x` },
@@ -1765,6 +1788,143 @@ describe("reading the repo as one tarball", () => {
       result.scanSummary.skippedFiles.every((file) => file.reason === "over-file-limit")
     ).toBe(true)
     expect(result.scanSummary.skippedCount).toBeGreaterThan(0)
+  })
+
+  describe("configs and fonts are budgeted by bytes, not counted", () => {
+    const LOADER = `eval(atob("YWxlcnQoMSk="))\n`
+    const FAKE_FONT = `const h = require('https');${" ".repeat(400)}h.get(u, r => eval(r))\n`
+    const REAL_FONT = "wOF2\u0000\u0001" + "\u0000".repeat(200)
+
+    /** 30 executed configs, then a hook file that runs a loader. */
+    function decoyWorkflowsThenHook(): Record<string, string> {
+      const files: Record<string, string> = {}
+      for (let i = 0; i < 30; i++) {
+        files[`.github/workflows/w${String(i).padStart(2, "0")}.yml`] = "on: push\njobs: {}\n"
+      }
+      files[".vscode/tasks.json"] = JSON.stringify({
+        tasks: [{ runOptions: { runOn: "folderOpen" }, command: "node", args: ["tools/run.cfg"] }],
+      })
+      files["tools/run.cfg"] = LOADER
+      return files
+    }
+
+    it("reads a config that 30 decoy configs push past the per-file cap", async () => {
+      const files = decoyWorkflowsThenHook()
+      const viaPerFile = (await scanVia(files, {}, false)).result
+      const { api, result } = await scanVia(files)
+
+      // The per-file path keeps its 25: the hook is the 31st config.
+      expect(viaPerFile.scanSummary.scannedFiles).not.toContain(".vscode/tasks.json")
+      expect(viaPerFile.scanSummary.skippedFiles).toContainEqual({
+        path: ".vscode/tasks.json",
+        reason: "over-file-limit",
+      })
+
+      expect(result.scanSummary.readMode).toBe("tarball")
+      expect(result.scanSummary.scannedFiles).toContain(".vscode/tasks.json")
+      expect(result.scanSummary.skippedFiles).toEqual([])
+      // Its command target was followed and scanned as JavaScript.
+      expect(
+        result.findings.some((f) => f.file === "tools/run.cfg" && f.type === "OBFUSCATED_CODE")
+      ).toBe(true)
+      // The target is the only file the archive's selection did not carry.
+      expect(api.contentReads()).toEqual(["tools/run.cfg"])
+    })
+
+    it("reads a nested README that executed configs and other READMEs outrank", async () => {
+      const files: Record<string, string> = {}
+      for (let i = 0; i < 26; i++) files[`.github/workflows/w${i}.yml`] = "on: push\n"
+      for (let i = 0; i < 40; i++) files[`packages/p${String(i).padStart(2, "0")}/README.md`] = "A package.\n"
+      files["packages/zz/README.md"] = "Run immediately — disable antivirus first, it is 100% safe.\n"
+      const flagged = (scan: Awaited<ReturnType<typeof scanGitHubRepo>>) =>
+        scan.findings.some(
+          (f) => f.type === "SOCIAL_ENGINEERING" && f.file === "packages/zz/README.md"
+        )
+
+      expect(flagged((await scanVia(files, {}, false)).result)).toBe(false)
+      const { result } = await scanVia(files)
+      expect(flagged(result)).toBe(true)
+      expect(result.scanSummary.filesScanned).toBe(Object.keys(files).length)
+    })
+
+    it("still bounds configs by bytes, in configPriority order", async () => {
+      // 5 READMEs of 1MB each behind a 100-byte executed config: the config
+      // is read first however late it sits in the tree, and the 4MB that is
+      // left after it holds three of the READMEs.
+      const files: Record<string, string> = {}
+      const sizes: Record<string, number> = { ".vscode/tasks.json": 100 }
+      for (let i = 0; i < 5; i++) {
+        files[`docs/d${i}/README.md`] = "Docs.\n"
+        sizes[`docs/d${i}/README.md`] = 1024 * 1024
+      }
+      files[".vscode/tasks.json"] = `{"tasks":[]}`
+      const { result } = await scanVia(files, { sizes })
+
+      expect(result.scanSummary.scannedFiles).toContain(".vscode/tasks.json")
+      expect(result.scanSummary.scannedFiles.filter((p) => p.endsWith("README.md"))).toHaveLength(3)
+      expect(result.scanSummary.skippedFiles).toEqual([
+        { path: "docs/d3/README.md", reason: "over-file-limit" },
+        { path: "docs/d4/README.md", reason: "over-file-limit" },
+      ])
+    })
+
+    it("catches a fake font placed after more than ten real ones", async () => {
+      const files: Record<string, string> = {}
+      for (let i = 0; i < 12; i++) files[`public/fonts/f${String(i).padStart(2, "0")}.woff2`] = REAL_FONT
+      files["public/fonts/zz-solid.woff2"] = FAKE_FONT
+      const isFake = (f: { pattern?: string; file?: string }) =>
+        f.pattern === "MASQUERADED_SCRIPT_FONT" && f.file === "public/fonts/zz-solid.woff2"
+
+      const viaPerFile = (await scanVia(files, {}, false)).result
+      expect(viaPerFile.findings.some(isFake)).toBe(false)
+      expect(viaPerFile.scanSummary.skippedFiles.map((s) => s.path)).toContain(
+        "public/fonts/zz-solid.woff2"
+      )
+
+      const { api, result } = await scanVia(files)
+      expect(result.findings.some(isFake)).toBe(true)
+      expect(result.findings.filter((f) => f.pattern === "MASQUERADED_SCRIPT_FONT")).toHaveLength(1)
+      expect(result.scanSummary.filesScanned).toBe(13)
+      expect(api.contentReads()).toEqual([])
+    })
+
+    it("holds fonts that fail the magic check whole only up to a byte budget", async () => {
+      // 18 fakes of 500KB: 8MB holds 16, and the rest are reported rather
+      // than fetched one by one or held regardless.
+      const body = FAKE_FONT + "//" + "x".repeat(500 * 1024 - FAKE_FONT.length - 3) + "\n"
+      const files: Record<string, string> = {}
+      for (let i = 0; i < 18; i++) files[`fonts/f${String(i).padStart(2, "0")}.woff2`] = body
+      const { api, result } = await scanVia(files)
+
+      expect(result.scanSummary.readMode).toBe("tarball")
+      expect(result.scanSummary.filesScanned).toBe(16)
+      expect(result.scanSummary.skippedFiles).toEqual([
+        { path: "fonts/f16.woff2", reason: "over-file-limit" },
+        { path: "fonts/f17.woff2", reason: "over-file-limit" },
+      ])
+      expect(api.contentReads()).toEqual([])
+    })
+
+    it("leaves the per-file selection exactly as it was", async () => {
+      const files: Record<string, string> = {}
+      for (let i = 0; i < 30; i++) files[`packages/p${String(i).padStart(2, "0")}/README.md`] = "A package.\n"
+      files[".devcontainer/devcontainer.json"] = `{"postCreateCommand":"./bootstrap"}`
+      for (let i = 0; i < 12; i++) files[`fonts/f${String(i).padStart(2, "0")}.woff2`] = REAL_FONT
+      for (let i = 0; i < 205; i++) files[`src/m${String(i).padStart(3, "0")}.js`] = `export const x = ${i}\n`
+      const { result } = await scanVia(files, {}, false)
+
+      const expected = [
+        ".devcontainer/devcontainer.json",
+        ...Array.from({ length: 24 }, (_, i) => `packages/p${String(i).padStart(2, "0")}/README.md`),
+        ...Array.from({ length: 10 }, (_, i) => `fonts/f${String(i).padStart(2, "0")}.woff2`),
+        ...Array.from({ length: 200 }, (_, i) => `src/m${String(i).padStart(3, "0")}.js`),
+      ]
+      expect(result.scanSummary.scannedFiles).toEqual(expected)
+      expect(result.scanSummary.skippedCount).toBe(6 + 2 + 5)
+      expect(
+        result.scanSummary.skippedFiles.every((s) => s.reason === "over-file-limit")
+      ).toBe(true)
+    })
   })
 
   describe("falling back to the per-file path", () => {

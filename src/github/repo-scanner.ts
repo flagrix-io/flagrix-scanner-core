@@ -16,6 +16,7 @@ import type {
   MaliciousPackage,
   RepoScanOptions,
   SkippedFile,
+  SkipReason,
 } from "../types/index.js"
 import { DEFAULT_DISCLAIMER } from "../types/index.js"
 import { collectEvidence } from "../utils/evidence.js"
@@ -30,6 +31,7 @@ import {
   MAX_TARBALL_TREE_BYTES,
   readRepoTarball,
   type TarballFallbackReason,
+  type TarballKeep,
 } from "./tarball.js"
 import { matchOsvFeed, npmDependencies, pythonDependencies, resolveNpmAlias, type DeclaredDependency } from "./osv-feed.js"
 import {
@@ -196,6 +198,7 @@ export function isConfigFile(path: string): boolean {
  * launched from a folderOpen task). Only a few, small ones are read.
  */
 const FONT_EXTENSIONS = [".woff", ".woff2", ".ttf", ".otf", ".eot"]
+/** Fonts read per scan on the per-file path, where each one is a request. */
 const MAX_FONT_FILES = 10
 const MAX_FONT_BYTES = 512 * 1024
 
@@ -203,8 +206,55 @@ function isFontFile(path: string): boolean {
   return FONT_EXTENSIONS.some((ext) => path.toLowerCase().endsWith(ext))
 }
 
-/** Extra budget for config files, on top of MAX_FILES_TO_SCAN. */
+/**
+ * Configs read per scan on the per-file path, on top of MAX_FILES_TO_SCAN.
+ * Each one costs a request there, so this is a request budget.
+ */
 const MAX_CONFIG_FILES = 25
+
+/**
+ * Config budget when the whole repo arrives in one request, where a count
+ * stops meaning anything: padding a repo with 25 decoy workflows or nested
+ * READMEs used to be enough to push a hook file or a poisoned README out of
+ * the scan. Bytes are what a config costs once reading is free.
+ *
+ * It is a budget of its own rather than a share of MAX_SOURCE_BYTES because a
+ * config costs far less than a source file of the same size: only sources
+ * keep a masked copy for the whole scan and go through the global detectors
+ * (the 13-14x overhead described there), while a config is decoded, matched
+ * against the config-scoped rules once and dropped. The largest total in the
+ * 50-repo reference corpus is nodejs/node at 1.3MB (256 configs, 210 of them
+ * READMEs); next.js has 393 configs in 1.0MB. 4MB reads every config of every
+ * one of them. Measured in a 384MB heap, reading all 124 of facebook/react's
+ * configs instead of 25 left peak heap where it was (205MB either way, within
+ * run-to-run noise), and all 188 of prisma/prisma's moved it from 167MB to
+ * 169MB. Taking those bytes out of MAX_SOURCE_BYTES instead would have bought
+ * nothing in memory and cost up to 1.3MB of source coverage.
+ */
+const MAX_SNAPSHOT_CONFIG_BYTES = 4 * 1024 * 1024
+/**
+ * Backstop for pathological trees, not a coverage limit: no corpus repo comes
+ * near it. Every config is a pass of the config-scoped rules and an entry in
+ * `scannedFiles`, so 4MB of 100-byte files would be 40,000 of each — time and
+ * result size that bytes alone do not bound.
+ */
+const MAX_SNAPSHOT_CONFIG_FILES = 2_000
+/**
+ * Fonts on the snapshot path: every font is magic-number-checked while the
+ * archive streams, so the count bound is a backstop for a tree of tens of
+ * thousands of icon fonts (each one is a buffer while its body arrives and an
+ * entry in `scannedFiles`). next.js, the most in the corpus, has 50.
+ */
+const MAX_SNAPSHOT_FONT_FILES = 2_000
+/**
+ * A real font keeps only its head (FONT_SNIFF_BYTES) once its magic number
+ * matches; a "font" that fails the check is kept whole for the masquerade
+ * check. This caps those whole ones: past it, the rest are skipped as
+ * over-file-limit rather than held — 16 fakes at the 512KB size limit.
+ */
+const MAX_SNAPSHOT_SUSPECT_FONT_BYTES = 8 * 1024 * 1024
+/** Enough for every magic number `isRealFont` reads (EOT's sits at 34). */
+const FONT_SNIFF_BYTES = 64
 
 /**
  * Files a config runs with a JS runtime — `node .vscode/spellright.dict`,
@@ -214,6 +264,15 @@ const MAX_CONFIG_FILES = 25
  * extension filter skipped them) and scanned as JavaScript. CI workflows are
  * left out: their steps run on CI runners, not on the cloner's machine, and
  * they routinely run test suites that evaluate generated code.
+ *
+ * The cap holds on the snapshot path too, because a target still costs a
+ * request there. Targets are known only once the configs naming them have
+ * been read, which is after the archive has streamed past, so a target the
+ * archive did not already carry is fetched on its own. Serving targets from
+ * the archive would mean holding every blob that might turn out to be one —
+ * the whole repo, several times the memory budget — or downloading it twice.
+ * Without the cap, one config naming hundreds of targets would spend an
+ * unauthenticated caller's 60 requests an hour and leave the scan partial.
  */
 const MAX_COMMAND_TARGETS = 10
 // CI workflows run on CI runners and container builds inside a container,
@@ -366,6 +425,21 @@ const MAX_FILE_SIZE_BYTES = 1024 * 1024
 // skippedFiles list cap — skippedCount stays accurate; this only bounds the
 // per-path detail so huge repos don't bloat the result object.
 const MAX_SKIPPED_FILES_LISTED = 500
+/**
+ * Which skips the capped list shows first: the ones that say the verdict
+ * rests on less than the scanner meant to read, then the files a budget left
+ * out, and only then the file types it never reads. Listed in tree order,
+ * the cap filled with images and lockfiles — facebook/react and
+ * prisma/prisma both listed 500 `unsupported-type` entries and not one of
+ * the files over a budget.
+ */
+const SKIP_LIST_ORDER: readonly SkipReason[] = [
+  "rate-limited",
+  "fetch-failed",
+  "over-file-limit",
+  "too-large",
+  "unsupported-type",
+]
 
 // npm download count cache (in-memory)
 interface NpmDownloadCacheEntry {
@@ -474,21 +548,24 @@ export async function scanGitHubRepo(
     const tree: GitHubTreeResponse = await treeResponse.json()
 
     // Partition every blob into "scan" vs "skip + why", so the UI can show
-    // exactly which files were read and why the rest were not.
-    const skippedFiles: SkippedFile[] = []
+    // exactly which files were read and why the rest were not. Skips are kept
+    // per reason, each list capped, and joined in SKIP_LIST_ORDER at the end,
+    // so a flood of one reason cannot push another out of the list.
+    const skippedByReason = new Map<SkipReason, SkippedFile[]>(
+      SKIP_LIST_ORDER.map((reason) => [reason, []])
+    )
     let skippedCount = 0
-    const skip = (path: string, reason: SkippedFile["reason"]) => {
+    const skip = (path: string, reason: SkipReason) => {
       skippedCount++
-      if (skippedFiles.length < MAX_SKIPPED_FILES_LISTED) {
-        skippedFiles.push({ path, reason })
-      }
+      const listed = skippedByReason.get(reason)!
+      if (listed.length < MAX_SKIPPED_FILES_LISTED) listed.push({ path, reason })
     }
 
-    // Editor/agent/CI configs and a few small fonts get their own budget on
-    // top of the source cap, so adding them never displaces source coverage
+    // Editor/agent/CI configs and small fonts get their own budget on top of
+    // the source budget, so adding them never displaces source coverage
     // (sharing one cap pushed 5–38 source files out of large repos).
     const configCandidates: GitHubTreeItem[] = []
-    const fontFiles: GitHubTreeItem[] = []
+    const fontCandidates: GitHubTreeItem[] = []
     const sourceBlobs: GitHubTreeItem[] = []
     for (const item of tree.tree) {
       if (item.type !== "blob") continue
@@ -503,8 +580,7 @@ export async function scanGitHubRepo(
         if (item.size !== undefined && item.size > sizeLimit) {
           skip(item.path, "too-large")
         } else if (font) {
-          if (fontFiles.length >= MAX_FONT_FILES) skip(item.path, "over-file-limit")
-          else fontFiles.push(item)
+          fontCandidates.push(item)
         } else {
           configCandidates.push(item)
         }
@@ -525,34 +601,51 @@ export async function scanGitHubRepo(
     // Spend the config budget on the configs a tool executes before the ones
     // it merely reads (configPriority), so widening the set never costs
     // coverage of the auto-run files. Tree order is kept inside each tier.
-    const configFiles = configCandidates
-    sortByPriority(configFiles, configPriority)
-    for (const item of configFiles.splice(MAX_CONFIG_FILES)) {
-      skip(item.path, "over-file-limit")
-    }
+    sortByPriority(configCandidates, configPriority)
 
-    /**
-     * Which sources fit the budget. The budget itself depends on how the
-     * contents will be read, so this runs once per candidate reader: under a
-     * byte cap when the whole repo comes in one request, and under the file
-     * cap when each file costs its own. Nothing is recorded here — the caller
-     * skips the leftovers only for the reader it ends up using, so an
-     * abandoned tarball attempt leaves no trace in the summary.
-     */
-    const selectSources = (byteCapped: boolean) => {
-      if (!byteCapped) {
-        return { kept: sourceBlobs.slice(0, MAX_FILES_TO_SCAN), overLimit: sourceBlobs.slice(MAX_FILES_TO_SCAN) }
-      }
+    /** The longest prefix of `items` whose sizes fit in `budget` bytes. */
+    const bytePrefix = (items: GitHubTreeItem[], budget: number, maxCount = Infinity) => {
       let bytes = 0
-      let cut = sourceBlobs.length
-      for (let index = 0; index < sourceBlobs.length; index++) {
-        bytes += sourceBlobs[index]!.size ?? 0
-        if (bytes > MAX_SOURCE_BYTES) {
+      let cut = Math.min(items.length, maxCount)
+      for (let index = 0; index < cut; index++) {
+        bytes += items[index]!.size ?? 0
+        if (bytes > budget) {
           cut = index
           break
         }
       }
-      return { kept: sourceBlobs.slice(0, cut), overLimit: sourceBlobs.slice(cut) }
+      return cut
+    }
+
+    /**
+     * Which configs, fonts and sources fit the budget. The budget itself
+     * depends on how the contents will be read, so this runs once per
+     * candidate reader: under byte budgets when the whole repo comes in one
+     * request, and under file counts when each file costs its own. Nothing is
+     * recorded here — the caller skips the leftovers only for the reader it
+     * ends up using, so an abandoned tarball attempt leaves no trace in the
+     * summary.
+     */
+    const selectFiles = (snapshot: boolean) => {
+      const configCut = snapshot
+        ? bytePrefix(configCandidates, MAX_SNAPSHOT_CONFIG_BYTES, MAX_SNAPSHOT_CONFIG_FILES)
+        : MAX_CONFIG_FILES
+      // Fonts are not budgeted by bytes on the snapshot path: a real one is
+      // trimmed to its magic number as the archive streams (`keepFromArchive`).
+      const fontCut = snapshot ? MAX_SNAPSHOT_FONT_FILES : MAX_FONT_FILES
+      const sourceCut = snapshot
+        ? bytePrefix(sourceBlobs, MAX_SOURCE_BYTES)
+        : MAX_FILES_TO_SCAN
+      return {
+        configs: configCandidates.slice(0, configCut),
+        fonts: fontCandidates.slice(0, fontCut),
+        sources: sourceBlobs.slice(0, sourceCut),
+        overLimit: [
+          ...configCandidates.slice(configCut),
+          ...fontCandidates.slice(fontCut),
+          ...sourceBlobs.slice(sourceCut),
+        ],
+      }
     }
 
     // Reading the repo as one tarball is opt-in: in the extension it needs an
@@ -563,7 +656,7 @@ export async function scanGitHubRepo(
     let readMode: "tarball" | "per-file" = "per-file"
     let readFallbackReason: TarballFallbackReason | undefined
     let tarballFiles: Map<string, Uint8Array> | null = null
-    let selected = selectSources(false)
+    let selected = selectFiles(false)
 
     if (options.tarball) {
       const treeBytes = tree.tree.reduce(
@@ -573,15 +666,43 @@ export async function scanGitHubRepo(
       if (treeBytes > MAX_TARBALL_TREE_BYTES) {
         readFallbackReason = "too-large"
       } else {
-        const candidate = selectSources(true)
+        const candidate = selectFiles(true)
+        const fontPaths = new Set(candidate.fonts.map((item) => item.path))
+        // Every font is checked, but only the ones that fail the check are
+        // held whole: a real font is settled by its first bytes, which are
+        // all the masquerade check reads of it. The fakes share a byte budget,
+        // so a repo stuffed with them cannot hold the archive in memory.
+        let suspectFontBytes = 0
+        const overBudgetFonts = new Set<string>()
+        const keepFromArchive: TarballKeep = (path, body) => {
+          if (!fontPaths.has(path)) return body
+          const head = body.subarray(0, FONT_SNIFF_BYTES)
+          // A copy, so the full body's buffer is released.
+          if (isRealFont(latin1(head), path)) return head.slice()
+          suspectFontBytes += body.byteLength
+          if (suspectFontBytes > MAX_SNAPSHOT_SUSPECT_FONT_BYTES) {
+            overBudgetFonts.add(path)
+            return null
+          }
+          return body
+        }
         const wanted = new Set(
-          [...configFiles, ...fontFiles, ...candidate.kept].map((item) => item.path)
+          [...candidate.configs, ...candidate.fonts, ...candidate.sources].map((item) => item.path)
         )
-        const read = await readRepoTarball(repo.owner, repo.repo, commitSha, wanted, headers)
+        const read = await readRepoTarball(
+          repo.owner, repo.repo, commitSha, wanted, headers, fetch, keepFromArchive
+        )
         if (read.ok) {
           readMode = "tarball"
           tarballFiles = read.files
-          selected = candidate
+          selected = {
+            ...candidate,
+            fonts: candidate.fonts.filter((item) => !overBudgetFonts.has(item.path)),
+            overLimit: [
+              ...candidate.overLimit,
+              ...candidate.fonts.filter((item) => overBudgetFonts.has(item.path)),
+            ],
+          }
         } else {
           readFallbackReason = read.reason
         }
@@ -591,7 +712,7 @@ export async function scanGitHubRepo(
     for (const item of selected.overLimit) {
       skip(item.path, "over-file-limit")
     }
-    const filesToScan = [...configFiles, ...fontFiles, ...selected.kept]
+    const filesToScan = [...selected.configs, ...selected.fonts, ...selected.sources]
     // Command targets discovered while reading configs join the queue later;
     // every blob is either queued or skipped, so a target is moved out of
     // the skipped list when it is queued.
@@ -603,8 +724,13 @@ export async function scanGitHubRepo(
     const installHooks: InstallHook[] = []
     const installHookFiles = new Set<string>()
     const unskip = (path: string) => {
-      const index = skippedFiles.findIndex((skipped) => skipped.path === path)
-      if (index !== -1) skippedFiles.splice(index, 1)
+      for (const listed of skippedByReason.values()) {
+        const index = listed.findIndex((skipped) => skipped.path === path)
+        if (index !== -1) {
+          listed.splice(index, 1)
+          break
+        }
+      }
       skippedCount--
     }
 
@@ -670,8 +796,13 @@ export async function scanGitHubRepo(
     const readFile = async (file: GitHubTreeItem): Promise<FileRead> => {
       // Already in hand from the tarball: no request, and the bytes are raw
       // rather than base64 round-tripped through atob.
+      // Each path is queued once, so its bytes are released as soon as they
+      // are decoded rather than held for the rest of the scan. A real font
+      // arrives as just its head (`keepFromArchive`), which is all the
+      // masquerade check reads of one.
       const fromTarball = tarballFiles?.get(file.path)
       if (fromTarball) {
+        tarballFiles!.delete(file.path)
         return {
           state: "read",
           content: isFontFile(file.path)
@@ -1004,7 +1135,8 @@ export async function scanGitHubRepo(
         patternsMatched,
         dependenciesChecked,
         scannedFiles,
-        skippedFiles,
+        skippedFiles: SKIP_LIST_ORDER.flatMap((reason) => skippedByReason.get(reason)!)
+          .slice(0, MAX_SKIPPED_FILES_LISTED),
         skippedCount,
         treeTruncated: tree.truncated,
         readMode,
@@ -1400,10 +1532,18 @@ const SCRIPT_TOKENS =
  * A font file whose bytes are printable text containing JavaScript is not a
  * font: it is a loader waiting for `node <file>` (task file, hook, script).
  */
-export function detectMasqueradedScript(content: string, filePath: string): GitHubFinding[] {
-  if (FONT_MAGIC.some((magic) => content.startsWith(magic))) return []
+/**
+ * The font's magic number is where it should be. `content` is one character
+ * per byte; the first FONT_SNIFF_BYTES are enough.
+ */
+function isRealFont(content: string, filePath: string): boolean {
+  if (FONT_MAGIC.some((magic) => content.startsWith(magic))) return true
   // EOT: "LP" magic at byte offset 34.
-  if (filePath.toLowerCase().endsWith(".eot") && content.slice(34, 36) === "LP") return []
+  return filePath.toLowerCase().endsWith(".eot") && content.slice(34, 36) === "LP"
+}
+
+export function detectMasqueradedScript(content: string, filePath: string): GitHubFinding[] {
+  if (isRealFont(content, filePath)) return []
   // Git LFS pointers are text by design.
   if (content.startsWith("version https://git-lfs.github.com/spec/")) return []
   const head = content.slice(0, 8192)
