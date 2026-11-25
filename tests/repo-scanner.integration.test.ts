@@ -2439,3 +2439,32 @@ describe("install hooks scored by what they can do", () => {
     expect(hook!.description).toContain("is obfuscated")
   })
 })
+
+describe("the verdict floor for configs a tool executes", () => {
+  const PADDING = {
+    id: "HIDDEN_CODE_WHITESPACE_PADDING", name: "padding",
+    pattern: String.raw`[ \t]{200,}\S`, description: "code pushed off-screen",
+    tags: [], severity: "high" as const, confidence: "medium" as const,
+    fileExtensions: [".js", ".cjs", ".mjs", ".ts"]
+  }
+  const padded = `module.exports = { content: [] };${" ".repeat(400)}void 0\n`
+
+  it("does not call a repo safe to clone over a padded tailwind.config.js", async () => {
+    global.fetch = mockGitHubApi({ "tailwind.config.js": padded }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, {
+      signatures: { ...EMPTY_SIGNATURES, yaraRules: [PADDING] }
+    })
+    expect(result.riskScore).toBeCloseTo(0.15)
+    expect(result.riskLevel).toBe("medium")
+    expect(result.safeToClone).toBe(false)
+  })
+
+  it("leaves the same padding in an ordinary source file at low", async () => {
+    global.fetch = mockGitHubApi({ "src/settings.js": padded }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, {
+      signatures: { ...EMPTY_SIGNATURES, yaraRules: [PADDING] }
+    })
+    expect(result.riskLevel).toBe("low")
+    expect(result.safeToClone).toBe(true)
+  })
+})

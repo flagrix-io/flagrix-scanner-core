@@ -39,6 +39,7 @@ import {
   calculateRiskScore,
   calculateSignalContributions,
   getRiskLevel,
+  isExecutedConfig,
 } from "../utils/risk-calculator.js"
 import {
   applyYaraRules,
@@ -1224,10 +1225,13 @@ export async function scanGitHubRepo(
 
     const rawRiskScore = calculateRawRiskScore(findings)
     const riskScore = calculateRiskScore(findings)
-    const riskLevel = getRiskLevel(riskScore, findings)
+    // Hooks in a folder core.hooksPath named are executed configs too, which
+    // their path alone cannot say.
+    const executedConfig = (path: string) => isExecutedConfig(path) || isGitHook(path)
+    const riskLevel = getRiskLevel(riskScore, findings, executedConfig)
     const cloneBlockingFindings = findings.filter((finding) => finding.cloneBlocking !== false)
     const cloneRiskScore = calculateRiskScore(cloneBlockingFindings)
-    const cloneRiskLevel = getRiskLevel(cloneRiskScore, cloneBlockingFindings)
+    const cloneRiskLevel = getRiskLevel(cloneRiskScore, cloneBlockingFindings, executedConfig)
 
     return {
       riskScore,
