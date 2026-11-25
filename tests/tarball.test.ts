@@ -255,6 +255,55 @@ describe("readRepoTarball", () => {
     expect([...result.files.keys()]).toEqual(["src/index.js"])
   })
 
+  it("lets the caller keep less of a file than its whole body", async () => {
+    const seen: string[] = []
+    const result = await readRepoTarball(
+      "acme",
+      "sample",
+      SHA,
+      new Set(["a.woff2", "b.woff2", "src/index.js"]),
+      {},
+      serve(
+        tarball({
+          "a.woff2": "wOF2" + "x".repeat(4000),
+          "b.woff2": "dropped entirely",
+          "src/index.js": "export const x = 1\n",
+        })
+      ),
+      (path, body) => {
+        seen.push(path)
+        if (path === "a.woff2") return body.slice(0, 4)
+        if (path === "b.woff2") return null
+        return body
+      }
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(seen.sort()).toEqual(["a.woff2", "b.woff2", "src/index.js"])
+    expect(new TextDecoder().decode(result.files.get("a.woff2")!)).toBe("wOF2")
+    expect(result.files.has("b.woff2")).toBe(false)
+    expect(result.files.has("src/index.js")).toBe(true)
+  })
+
+  it("is not unreadable when the caller keeps nothing of the files it saw", async () => {
+    // Emptiness means "this was not the commit's archive" only when no
+    // wanted entry turned up at all, not when `keep` chose to hold none.
+    const result = await readRepoTarball(
+      "acme",
+      "sample",
+      SHA,
+      new Set(["a.woff2"]),
+      {},
+      serve(tarball({ "a.woff2": "not a font" })),
+      () => null
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.files.size).toBe(0)
+  })
+
   describe("falling back to the per-file path", () => {
     it("reports unavailable when GitHub refuses the request", async () => {
       const result = await readRepoTarball(
