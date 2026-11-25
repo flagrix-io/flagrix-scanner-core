@@ -175,7 +175,7 @@ function decodeUtf8(binary: string): string {
 
 /**
  * One character per byte, the same string `atob` yields — which is what the
- * font magic-number check reads. `TextDecoder("latin1")` cannot stand in for
+ * masquerade check reads a font as. `TextDecoder("latin1")` cannot stand in for
  * this: the Encoding spec maps that label to windows-1252, which rewrites
  * 0x80–0x9F and so would corrupt the very bytes being identified.
  */
@@ -240,21 +240,19 @@ const MAX_SNAPSHOT_CONFIG_BYTES = 4 * 1024 * 1024
  */
 const MAX_SNAPSHOT_CONFIG_FILES = 2_000
 /**
- * Fonts on the snapshot path: every font is magic-number-checked while the
- * archive streams, so the count bound is a backstop for a tree of tens of
+ * Fonts on the snapshot path: every font is checked for script text while
+ * the archive streams, so the count bound is a backstop for a tree of tens of
  * thousands of icon fonts (each one is a buffer while its body arrives and an
  * entry in `scannedFiles`). next.js, the most in the corpus, has 50.
  */
 const MAX_SNAPSHOT_FONT_FILES = 2_000
 /**
- * A real font keeps only its head (FONT_SNIFF_BYTES) once its magic number
- * matches; a "font" that fails the check is kept whole for the masquerade
- * check. This caps those whole ones: past it, the rest are skipped as
- * over-file-limit rather than held — 16 fakes at the 512KB size limit.
+ * A font with no script text in it is settled as it streams and keeps none of
+ * its bytes; one that has some is kept whole for the masquerade check. This
+ * caps those whole ones: past it, the rest are skipped as over-file-limit
+ * rather than held — 16 fakes at the 512KB size limit.
  */
 const MAX_SNAPSHOT_SUSPECT_FONT_BYTES = 8 * 1024 * 1024
-/** Enough for every magic number `isRealFont` reads (EOT's sits at 34). */
-const FONT_SNIFF_BYTES = 64
 
 /**
  * Files a config runs with a JS runtime — `node .vscode/spellright.dict`,
@@ -630,8 +628,8 @@ export async function scanGitHubRepo(
       const configCut = snapshot
         ? bytePrefix(configCandidates, MAX_SNAPSHOT_CONFIG_BYTES, MAX_SNAPSHOT_CONFIG_FILES)
         : MAX_CONFIG_FILES
-      // Fonts are not budgeted by bytes on the snapshot path: a real one is
-      // trimmed to its magic number as the archive streams (`keepFromArchive`).
+      // Fonts are not budgeted by bytes on the snapshot path: one with no
+      // script text keeps nothing as the archive streams (`keepFromArchive`).
       const fontCut = snapshot ? MAX_SNAPSHOT_FONT_FILES : MAX_FONT_FILES
       const sourceCut = snapshot
         ? bytePrefix(sourceBlobs, MAX_SOURCE_BYTES)
@@ -668,17 +666,16 @@ export async function scanGitHubRepo(
       } else {
         const candidate = selectFiles(true)
         const fontPaths = new Set(candidate.fonts.map((item) => item.path))
-        // Every font is checked, but only the ones that fail the check are
-        // held whole: a real font is settled by its first bytes, which are
-        // all the masquerade check reads of it. The fakes share a byte budget,
-        // so a repo stuffed with them cannot hold the archive in memory.
+        // Every font is checked, but only the ones with script text in them
+        // are held whole: a font with none is settled here, and an empty body
+        // is what the masquerade check then reads for it. The suspects share
+        // a byte budget, so a repo stuffed with them cannot hold the archive
+        // in memory.
         let suspectFontBytes = 0
         const overBudgetFonts = new Set<string>()
         const keepFromArchive: TarballKeep = (path, body) => {
           if (!fontPaths.has(path)) return body
-          const head = body.subarray(0, FONT_SNIFF_BYTES)
-          // A copy, so the full body's buffer is released.
-          if (isRealFont(latin1(head), path)) return head.slice()
+          if (scriptTextOffset(latin1(body)) === -1) return new Uint8Array(0)
           suspectFontBytes += body.byteLength
           if (suspectFontBytes > MAX_SNAPSHOT_SUSPECT_FONT_BYTES) {
             overBudgetFonts.add(path)
@@ -797,9 +794,9 @@ export async function scanGitHubRepo(
       // Already in hand from the tarball: no request, and the bytes are raw
       // rather than base64 round-tripped through atob.
       // Each path is queued once, so its bytes are released as soon as they
-      // are decoded rather than held for the rest of the scan. A real font
-      // arrives as just its head (`keepFromArchive`), which is all the
-      // masquerade check reads of one.
+      // are decoded rather than held for the rest of the scan. A font with no
+      // script text in it arrives empty (`keepFromArchive`), which is all the
+      // masquerade check needs of one.
       const fromTarball = tarballFiles?.get(file.path)
       if (fromTarball) {
         tarballFiles!.delete(file.path)
@@ -837,7 +834,7 @@ export async function scanGitHubRepo(
       // atob() yields one Latin-1 char per byte. Decode text as UTF-8 so
       // non-ASCII detectors (invisible-Unicode payloads, bidi controls,
       // non-English comments) see real code points instead of mojibake.
-      // Fonts stay byte strings for the magic-number check.
+      // Fonts stay byte strings for the masquerade check.
       const binary = atob(fileData.content || "")
       return {
         state: "read",
@@ -1524,36 +1521,55 @@ function scanPythonDeps(
 
 // ─── Masqueraded scripts ──────────────────────────────────────────────────────
 
-const FONT_MAGIC = ["wOFF", "wOF2", "\u0000\u0001\u0000\u0000", "OTTO", "true", "ttcf"]
 const SCRIPT_TOKENS =
-  /\b(?:require\s*\(|import\s+[\w{*]|function\s*\w*\s*\(|const\s+\w+\s*=|let\s+\w+\s*=|var\s+\w+\s*=|eval\s*\(|new\s+Function|module\.exports|process\.env|child_process)/
+  /\b(?:require\s*\(|import\s+[\w{*]|function\s*\w*\s*\(|const\s+\w+\s*=|let\s+\w+\s*=|var\s+\w+\s*=|eval\s*\(|new\s+Function|module\.exports|process\.env|child_process)/g
+/** Bytes either side of a script token that have to read as text too. */
+const SCRIPT_TEXT_WINDOW = 256
 
-/**
- * A font file whose bytes are printable text containing JavaScript is not a
- * font: it is a loader waiting for `node <file>` (task file, hook, script).
- */
-/**
- * The font's magic number is where it should be. `content` is one character
- * per byte; the first FONT_SNIFF_BYTES are enough.
- */
-function isRealFont(content: string, filePath: string): boolean {
-  if (FONT_MAGIC.some((magic) => content.startsWith(magic))) return true
-  // EOT: "LP" magic at byte offset 34.
-  return filePath.toLowerCase().endsWith(".eot") && content.slice(34, 36) === "LP"
-}
-
-export function detectMasqueradedScript(content: string, filePath: string): GitHubFinding[] {
-  if (isRealFont(content, filePath)) return []
-  // Git LFS pointers are text by design.
-  if (content.startsWith("version https://git-lfs.github.com/spec/")) return []
-  const head = content.slice(0, 8192)
-  if (head.length === 0) return []
+function isPrintableText(text: string): boolean {
+  if (text.length === 0) return false
   let printable = 0
-  for (let index = 0; index < head.length; index++) {
-    const code = head.charCodeAt(index)
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index)
     if (code === 9 || code === 10 || code === 13 || (code >= 32 && code < 127)) printable++
   }
-  if (printable / head.length < 0.95 || !SCRIPT_TOKENS.test(content)) return []
+  return printable / text.length >= 0.95
+}
+
+/**
+ * Where a font file holds JavaScript: the first script token that sits in a
+ * run of plain text, or -1. `content` is one character per byte.
+ *
+ * Nothing about the file's header is trusted. A font's magic number is no
+ * proof: `wOF2`, `wOFF`, `OTTO`, `ttcf` and `true` all start valid JavaScript
+ * (`wOF2=0;…` runs under `node`), and a header can be faked inside a comment.
+ * What a loader cannot do without is the script itself, as text. Real font
+ * data does not contain it: 488 fonts (every TTF, TTC, OTF, WOFF, WOFF2 and
+ * EOT in macOS and in the reference corpus) have not one script-token match,
+ * let alone one inside a run of text. The text window keeps a token that
+ * compressed or binary data spells by chance from counting.
+ */
+function scriptTextOffset(content: string): number {
+  for (const match of content.matchAll(SCRIPT_TOKENS)) {
+    const index = match.index ?? 0
+    const around = content.slice(
+      Math.max(0, index - SCRIPT_TEXT_WINDOW),
+      index + match[0].length + SCRIPT_TEXT_WINDOW
+    )
+    if (isPrintableText(around)) return index
+  }
+  return -1
+}
+
+/**
+ * A font file holding readable JavaScript is not a font: it is a loader
+ * waiting for `node <file>` (task file, hook, script) or a `require()`.
+ */
+export function detectMasqueradedScript(content: string, filePath: string): GitHubFinding[] {
+  const at = scriptTextOffset(content)
+  if (at === -1) return []
+  // From the start of the line the script text is on.
+  const lineStart = content.lastIndexOf("\n", at) + 1
   return [{
     severity: "critical",
     confidence: "high",
@@ -1561,7 +1577,7 @@ export function detectMasqueradedScript(content: string, filePath: string): GitH
     pattern: "MASQUERADED_SCRIPT_FONT",
     file: filePath,
     description: `JavaScript disguised as a font file: ${filePath}`,
-    codeSnippet: content.trimStart().slice(0, 200),
+    codeSnippet: content.slice(lineStart, lineStart + 200).trimStart(),
     codeExplanation:
       "🎭 This file has a font extension but contains readable JavaScript, not font data. Fake font files are run with `node <file>` from VS Code tasks or hooks to hide a loader from code review.",
   }]
