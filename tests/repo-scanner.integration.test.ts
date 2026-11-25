@@ -1116,6 +1116,19 @@ describe("container builds, devcontainers and nested instruction files", () => {
     )).toBe(true)
   })
 
+  it("does not read a quick start or a fast library as urgency", async () => {
+    // The shapes of the READMEs that flagged cpython, rust's miri and
+    // apollo-client once nested READMEs were read in full.
+    global.fetch = mockGitHubApi({
+      "Mac/README.rst": "Quick start\n\nInstalling the framework needs admin privileges.\n",
+      "tools/miri/README.md": "Miri is fast enough for CI. A program that passes is not 100% safe.\n",
+      "README.md": "## Quickstart\n\nA fast client, used by millions of end users.\n"
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+    expect(result.scanSummary.filesScanned).toBe(3)
+    expect(result.findings.filter((f) => f.type === "SOCIAL_ENGINEERING")).toEqual([])
+  })
+
   it("reads agent commands, subagents, skills and nested editor rules", async () => {
     const MD = ruleSet({
       id: "AI_INSTRUCTION_INJECTION", name: "injection",

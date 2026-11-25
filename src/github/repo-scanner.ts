@@ -2587,8 +2587,14 @@ function detectSocialEngineering(content: string, filePath: string): GitHubFindi
 
   if (!/README/i.test(filePath)) return findings
 
+  // "quick" and "fast" are not urgency: they are "Quick start" and "fast"
+  // in the README of nearly every project, and paired with any one other
+  // pattern ("admin privileges", "100% safe") they flagged python/cpython's
+  // Mac, iOS and Windows-installer READMEs, rust's miri and apollo-client's
+  // root README once nested READMEs were read. The words a lure leans on
+  // are the ones about time running out.
   const socialEngineeringPatterns = [
-    { pattern: /(?:urgent|immediately|quick|fast|act now|limited time)/gi, type: "Urgency Language", severity: "medium" as const },
+    { pattern: /\b(?:urgent(?:ly)?|immediately|act now|limited time)\b/gi, type: "Urgency Language", severity: "medium" as const },
     { pattern: /(?:disable|turn off|bypass)[\s\w]*(?:antivirus|firewall|security|protection)/gi, type: "Security Bypass Instructions", severity: "high" as const },
     { pattern: /(?:admin|root|sudo)[\s\w]*(?:rights|privileges|access|permission)/gi, type: "Privilege Escalation Language", severity: "medium" as const },
     { pattern: /(?:100%|totally|completely|absolutely)[\s\w]*(?:safe|secure|trusted|legit)/gi, type: "Over-assurance Language", severity: "low" as const },
