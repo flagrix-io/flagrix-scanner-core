@@ -5,10 +5,12 @@
  * tool, linter, or tutorial repo scans as malicious (including this one).
  *
  * Masking (not stripping) preserves line/column positions, so evidence line
- * numbers stay correct. String literals and comments are left untouched:
+ * numbers stay correct. String literals and comments are left untouched here:
  * strings can hold real payloads (base64 blobs, URLs) that must stay
  * scannable, and hiding behavior in a regex literal isn't possible — a regex
- * never executes anything.
+ * never executes anything. Comments are masked only for the few rules that
+ * are purely about executable syntax (`maskComments`, below) and stay
+ * scannable for everything else.
  */
 
 /**
@@ -173,6 +175,80 @@ export function maskStringLiterals(content: string): string {
       const j = close === -1 ? content.length : close + 2
       out += content.slice(i, j)
       i = j
+      continue
+    }
+
+    out += ch
+    i++
+  }
+
+  return out
+}
+
+/**
+ * Masks the interiors of comments (`// …`, `/* … *\/`) with MASK_FILL,
+ * leaving the delimiters and every string literal untouched.
+ *
+ * For rules about executable syntax only. A comment that *names* an attack
+ * cannot run: `stratum+tcp://pool.minexmr.com:3333` written in a comment is
+ * documentation, and this scanner's own source — where every narrowed
+ * pattern is explained in a comment beside it — scanned as a
+ * critical-severity crypto miner because of it. Security tools, IOC lists
+ * and tutorials all read that way.
+ *
+ * NOT for the checks that exist to read comments: invisible Unicode and bidi
+ * payloads, hidden agent instructions and non-English comments are all about
+ * what a comment holds, and a base64 blob parked in one is worth saying. Only
+ * rules that opt in (see COMMENT_EXEMPT_RULE_IDS) match against this.
+ *
+ * Run AFTER maskRegexLiterals, for the reason maskStringLiterals gives: a
+ * regex literal holding a quote or a `//` would otherwise poison the state.
+ * Length and newlines are preserved, so evidence line numbers stay true.
+ */
+export function maskComments(content: string): string {
+  let out = ""
+  let i = 0
+  let quote: string | null = null
+
+  while (i < content.length) {
+    const ch = content[i]!
+
+    if (quote) {
+      if (ch === "\\") {
+        out += content.slice(i, i + 2)
+        i += 2
+        continue
+      }
+      if (ch === quote) quote = null
+      out += ch
+      i++
+      continue
+    }
+
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch
+      out += ch
+      i++
+      continue
+    }
+
+    if (ch === "/" && content[i + 1] === "/") {
+      let end = content.indexOf("\n", i)
+      if (end === -1) end = content.length
+      out += "//" + MASK_FILL.repeat(end - i - 2)
+      i = end
+      continue
+    }
+
+    if (ch === "/" && content[i + 1] === "*") {
+      const close = content.indexOf("*/", i + 2)
+      const end = close === -1 ? content.length : close + 2
+      const body = content.slice(i + 2, close === -1 ? end : close)
+      out +=
+        "/*" +
+        [...body].map((c) => (c === "\n" ? "\n" : MASK_FILL)).join("") +
+        (close === -1 ? "" : "*/")
+      i = end
       continue
     }
 
