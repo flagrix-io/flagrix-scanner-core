@@ -701,6 +701,32 @@ describe("editor / agent config files and masqueraded scripts", () => {
     })
     expect(result.findings.filter((f) => f.pattern === "MASQUERADED_SCRIPT_FONT")).toEqual([])
   })
+
+  describe("fonts are judged by their content, not their header", () => {
+    const LOADER = `const h = require('https');${" ".repeat(400)}h.get(u, r => eval(r))\n`
+    const masquerades = async (font: string) => {
+      const result = await scan({ "public/fonts/fa-solid-500.woff2": font })
+      return result.findings.some((f) => f.pattern === "MASQUERADED_SCRIPT_FONT")
+    }
+
+    it("flags a loader that opens with a font magic number", async () => {
+      // Each of these starts valid JavaScript, so `node` runs the file as is.
+      for (const prefix of ["wOF2=0;", "wOFF=0;", "OTTO=0;", "ttcf=0;", "true;"]) {
+        expect(await masquerades(prefix + LOADER), prefix).toBe(true)
+      }
+      // EOT's magic sits at byte 34, which a comment can put there.
+      expect(await masquerades(`/*${"x".repeat(32)}LP*/` + LOADER)).toBe(true)
+    })
+
+    it("flags a loader whose first bytes are binary inside a comment", async () => {
+      expect(await masquerades(`/*${"\u0001\u0002".repeat(5000)}*/\n` + LOADER)).toBe(true)
+    })
+
+    it("does not count a script token that binary data spells by chance", async () => {
+      const noise = "\u0001\u0002\u0003\u0004".repeat(1000)
+      expect(await masquerades(`wOF2${noise}require(${noise}`)).toBe(false)
+    })
+  })
 })
 
 describe("files that configs run with node", () => {
@@ -1901,7 +1927,21 @@ describe("reading the repo as one tarball", () => {
       expect(api.contentReads()).toEqual([])
     })
 
-    it("holds fonts that fail the magic check whole only up to a byte budget", async () => {
+    it("catches a loader behind a font magic number, and keeps no bytes of real fonts", async () => {
+      const files: Record<string, string> = {}
+      for (let i = 0; i < 12; i++) files[`public/fonts/f${String(i).padStart(2, "0")}.woff2`] = REAL_FONT
+      files["public/fonts/zz-solid.woff2"] = "wOF2=0;" + FAKE_FONT
+      const { api, result } = await scanVia(files)
+
+      expect(result.scanSummary.readMode).toBe("tarball")
+      expect(result.scanSummary.filesScanned).toBe(13)
+      expect(
+        result.findings.filter((f) => f.pattern === "MASQUERADED_SCRIPT_FONT").map((f) => f.file)
+      ).toEqual(["public/fonts/zz-solid.woff2"])
+      expect(api.contentReads()).toEqual([])
+    })
+
+    it("holds fonts with script text whole only up to a byte budget", async () => {
       // 18 fakes of 500KB: 8MB holds 16, and the rest are reported rather
       // than fetched one by one or held regardless.
       const body = FAKE_FONT + "//" + "x".repeat(500 * 1024 - FAKE_FONT.length - 3) + "\n"
